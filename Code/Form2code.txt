@@ -1,0 +1,514 @@
+using System;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using Accord.Video;
+using Accord.Video.DirectShow;
+using Accord.Video.FFMPEG;
+using NAudio.Wave;
+
+namespace TestCamera
+{
+    public partial class Form2 : Form
+    {
+        private string _lastScrcpyFolder = "";
+        private string _lastWebcamFolder = "";
+
+        // --- WINDOWS API IMPORTS ---
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLong")]
+        private static extern int GetWindowLong32(IntPtr hWnd, int nIndex);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr")]
+        private static extern IntPtr GetWindowLongPtr64(IntPtr hWnd, int nIndex);
+        [DllImport("user32.dll", EntryPoint = "SetWindowLong")]
+        private static extern int SetWindowLong32(IntPtr hWnd, int nIndex, int dwNewLong);
+        [DllImport("user32.dll", EntryPoint = "SetWindowLongPtr")]
+        private static extern IntPtr SetWindowLongPtr64(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool MoveWindow(IntPtr hWnd, int x, int y, int cx, int cy, bool repaint);
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern IntPtr SendMessage(IntPtr hWnd, UInt32 Msg, IntPtr wParam, IntPtr lParam);
+
+        private const uint WM_CLOSE = 0x0010;
+        private const int GWL_STYLE = -16;
+        private const int WS_CHILD = 0x40000000;
+        private const int WS_CAPTION = 0x00C00000;
+        private const int WS_THICKFRAME = 0x00040000;
+        private const uint SWP_NOMOVE = 0x0002;
+        private const uint SWP_NOSIZE = 0x0001;
+        private const uint SWP_NOZORDER = 0x0004;
+        private const uint SWP_FRAMECHANGED = 0x0020;
+
+        private string _adbPath;
+        private string _scrcpyPath;
+        private Process _scrcpyProcess;
+
+        private FilterInfoCollection videoDevices;
+        private VideoCaptureDevice videoSource;
+        private VideoFileWriter videoWriter;
+
+        // --- NAudio Variables ---
+        private WaveInEvent waveIn;
+        private WaveFileWriter waveWriter;
+
+        // --- File Saving Variables ---
+        private bool isRecording = false;
+        private bool needToOpenWriter = false;
+        private string saveFileName = "";      // The Final File the user wants
+        private string tempVideoFile = "";     // Temporary silent video
+        private string tempAudioFile = "";     // Temporary audio file
+
+        private readonly object _writerLock = new object();
+        private DateTime _lastUiUpdate = DateTime.MinValue;
+
+        private int _lastPanelWidth = 0;
+        private int _lastPanelHeight = 0;
+        private int _forceResizeTicks = 0;
+        private System.Windows.Forms.Timer _scrcpyResizeTimer;
+
+        public Form2()
+        {
+            InitializeComponent();
+        }
+
+        public Form2(string adbPath, string scrcpyPath)
+        {
+            _adbPath = adbPath;
+            _scrcpyPath = scrcpyPath;
+            InitializeComponent();
+
+            this.DoubleBuffered = true;
+            this.BackColor = Color.Black;
+
+            if (pictureBox1 != null)
+            {
+                pictureBox1.Parent = this;
+                pictureBox1.SizeMode = PictureBoxSizeMode.Zoom;
+                pictureBox1.BackColor = Color.Black;
+            }
+
+            if (panelContainer != null)
+            {
+                panelContainer.Parent = this;
+                panelContainer.BackColor = Color.Black;
+                panelContainer.Visible = false;
+            }
+
+            _scrcpyResizeTimer = new System.Windows.Forms.Timer();
+            _scrcpyResizeTimer.Interval = 200;
+            _scrcpyResizeTimer.Tick += (s, ev) => ResizeEmbeddedWindow();
+
+            if (panelContainer != null) panelContainer.Resize += PanelContainer_Resize;
+
+            Load += Form2_Load;
+            FormClosing += Form2_FormClosing;
+            this.Resize += Form2_Resize;
+        }
+
+        private void Form2_Load(object sender, EventArgs e) { }
+
+        public void ArrangeLayout()
+        {
+            if (this.InvokeRequired) { this.Invoke(new Action(ArrangeLayout)); return; }
+
+            bool hasScrcpy = (_scrcpyProcess != null && !_scrcpyProcess.HasExited);
+            bool hasCam = isRecording;
+
+            if (hasScrcpy && hasCam)
+            {
+                panelContainer.Visible = true;
+                pictureBox1.Visible = true;
+                panelContainer.Dock = DockStyle.Left;
+                panelContainer.Width = this.ClientSize.Width / 2;
+                pictureBox1.Dock = DockStyle.Fill;
+                pictureBox1.BringToFront();
+            }
+            else if (hasScrcpy)
+            {
+                pictureBox1.Visible = false;
+                panelContainer.Visible = true;
+                panelContainer.Dock = DockStyle.Fill;
+                panelContainer.BringToFront();
+            }
+            else if (hasCam)
+            {
+                panelContainer.Visible = false;
+                pictureBox1.Visible = true;
+                pictureBox1.Dock = DockStyle.Fill;
+                pictureBox1.BringToFront();
+            }
+        }
+
+        private void Form2_Resize(object sender, EventArgs e)
+        {
+            ResizeEmbeddedWindow(true);
+            ArrangeLayout();
+        }
+
+        private void PanelContainer_Resize(object sender, EventArgs e) { ResizeEmbeddedWindow(); }
+
+        private void TurnCameraOn()
+        {
+            if (videoSource == null)
+            {
+                videoDevices = new FilterInfoCollection(FilterCategory.VideoInputDevice);
+                if (videoDevices.Count > 0)
+                {
+                    videoSource = new VideoCaptureDevice(videoDevices[0].MonikerString);
+                    videoSource.NewFrame += new NewFrameEventHandler(VideoSource_NewFrame);
+                    videoSource.Start();
+                }
+            }
+
+            // Start Audio capture and save it to the Temporary Audio File
+            if (waveIn == null)
+            {
+                try
+                {
+                    waveIn = new WaveInEvent();
+                    waveIn.WaveFormat = new WaveFormat(44100, 16, 1);
+
+                    if (!string.IsNullOrEmpty(tempAudioFile))
+                    {
+                        waveWriter = new WaveFileWriter(tempAudioFile, waveIn.WaveFormat);
+                    }
+
+                    waveIn.DataAvailable += WaveIn_DataAvailable;
+                    waveIn.StartRecording();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("Could not start microphone: " + ex.Message);
+                }
+            }
+        }
+
+        private void TurnCameraOff()
+        {
+            if (videoSource != null)
+            {
+                videoSource.NewFrame -= new NewFrameEventHandler(VideoSource_NewFrame);
+                videoSource.SignalToStop();
+                videoSource.WaitForStop();
+                videoSource = null;
+            }
+
+            if (waveIn != null)
+            {
+                try
+                {
+                    waveIn.StopRecording();
+                    waveIn.DataAvailable -= WaveIn_DataAvailable;
+                    waveIn.Dispose();
+                    waveIn = null;
+                }
+                catch { }
+            }
+
+            if (waveWriter != null)
+            {
+                try
+                {
+                    waveWriter.Dispose();
+                    waveWriter = null;
+                }
+                catch { }
+            }
+        }
+
+        public bool testCamStart(bool isAutoReconnect = false)
+        {
+            if (!isAutoReconnect)
+            {
+                using (SaveFileDialog sfd = new SaveFileDialog())
+                {
+                    sfd.Title = "Choose where to save the Webcam video";
+                    sfd.Filter = "MP4 Video File|*.mp4";
+                    sfd.FileName = "Webcam_Video_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".mp4";
+
+                    if (sfd.ShowDialog() != DialogResult.OK) return false;
+
+                    saveFileName = sfd.FileName;
+                    _lastWebcamFolder = Path.GetDirectoryName(saveFileName);
+                }
+            }
+            else
+            {
+                if (string.IsNullOrEmpty(_lastWebcamFolder)) _lastWebcamFolder = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos);
+                saveFileName = Path.Combine(_lastWebcamFolder, "Webcam_Video_Reconnect_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".mp4");
+            }
+
+            // --- Generate Temporary file paths for the split audio and video ---
+            string directory = Path.GetDirectoryName(saveFileName);
+            string baseName = Path.GetFileNameWithoutExtension(saveFileName);
+            tempVideoFile = Path.Combine(directory, baseName + "_TEMP_VIDEO.mp4");
+            tempAudioFile = Path.Combine(directory, baseName + "_TEMP_AUDIO.wav");
+
+            TurnCameraOn();
+            needToOpenWriter = true;
+            isRecording = true;
+            ArrangeLayout();
+            return true;
+        }
+
+        public void testCamStop()
+        {
+            isRecording = false;
+
+            // 1. Fully Stop everything and close the files
+            TurnCameraOff();
+            lock (_writerLock)
+            {
+                try
+                {
+                    if (videoWriter != null && videoWriter.IsOpen)
+                    {
+                        videoWriter.Close();
+                        videoWriter.Dispose();
+                        videoWriter = null;
+                    }
+                }
+                catch { }
+            }
+
+            // 2. MERGE them instantly into the final MP4 file!
+            if (!string.IsNullOrEmpty(tempVideoFile) && !string.IsNullOrEmpty(tempAudioFile))
+            {
+                MergeVideoAndAudio(tempVideoFile, tempAudioFile, saveFileName);
+            }
+        }
+
+        // --- NEW METHOD: MERGES VIDEO AND AUDIO INTO ONE PERFECT MP4 ---
+        private void MergeVideoAndAudio(string videoPath, string audioPath, string outputPath)
+        {
+            if (!File.Exists(videoPath) || !File.Exists(audioPath)) return;
+
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = "ffmpeg.exe",
+                    // Instantly combines the video and audio perfectly into outputpath
+                    Arguments = $"-y -i \"{videoPath}\" -i \"{audioPath}\" -c:v copy -c:a aac \"{outputPath}\"",
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+
+                using (Process p = Process.Start(psi))
+                {
+                    p.WaitForExit(); // Wait a second for it to finish packaging
+                }
+
+                // Clean up the temporary files so only the single, final MP4 remains!
+                if (File.Exists(outputPath))
+                {
+                    File.Delete(videoPath);
+                    File.Delete(audioPath);
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Could not merge audio and video. Please ensure 'ffmpeg.exe' is in your app folder!\n\n" + ex.Message, "Missing FFmpeg");
+            }
+        }
+
+        public async Task<bool> StartAndEmbedScrcpy(bool isAutoReconnect = false)
+        {
+            string scrcpySavePath = "";
+
+            if (!isAutoReconnect)
+            {
+                using (SaveFileDialog sfd = new SaveFileDialog())
+                {
+                    sfd.Title = "Choose where to save the Android video";
+                    // --- CHANGED: Standardized Scrcpy format to MP4 ---
+                    sfd.Filter = "MP4 Video File|*.mp4";
+                    sfd.FileName = "Scrcpy_Video_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".mp4";
+
+                    if (sfd.ShowDialog() != DialogResult.OK) return false;
+
+                    scrcpySavePath = sfd.FileName;
+                    _lastScrcpyFolder = Path.GetDirectoryName(scrcpySavePath);
+                }
+            }
+            else
+            {
+                if (string.IsNullOrEmpty(_lastScrcpyFolder)) _lastScrcpyFolder = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos);
+                // --- CHANGED: Standardized Auto-Reconnect to MP4 ---
+                scrcpySavePath = Path.Combine(_lastScrcpyFolder, "Scrcpy_Video_Reconnect_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".mp4");
+            }
+
+            ProcessStartInfo psi = new ProcessStartInfo
+            {
+                FileName = _scrcpyPath,
+                Arguments = $"-m 1024 -b 2M --max-fps 60 --window-borderless -r \"{scrcpySavePath}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden,
+                RedirectStandardError = true
+            };
+
+            psi.EnvironmentVariables["ADB"] = _adbPath;
+            psi.WorkingDirectory = System.IO.Path.GetDirectoryName(_scrcpyPath);
+
+            _scrcpyProcess = Process.Start(psi);
+            _scrcpyProcess.EnableRaisingEvents = true;
+
+            while (_scrcpyProcess.MainWindowHandle == IntPtr.Zero)
+            {
+                await Task.Delay(100);
+                _scrcpyProcess.Refresh();
+                if (_scrcpyProcess.HasExited) return true;
+            }
+
+            await Task.Delay(200);
+            IntPtr hwnd = _scrcpyProcess.MainWindowHandle;
+
+            int style = GetWindowLong(hwnd, GWL_STYLE);
+            style = (style & ~WS_CAPTION & ~WS_THICKFRAME) | WS_CHILD;
+
+            SetParent(hwnd, panelContainer.Handle);
+            SetWindowLong(hwnd, GWL_STYLE, style);
+            SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+
+            _forceResizeTicks = 25;
+            ResizeEmbeddedWindow(true);
+            _scrcpyResizeTimer.Start();
+
+            ArrangeLayout();
+            return true;
+        }
+
+        private void ResizeEmbeddedWindow(bool force = false)
+        {
+            if (_scrcpyProcess != null && !_scrcpyProcess.HasExited && _scrcpyProcess.MainWindowHandle != IntPtr.Zero)
+            {
+                if (force || _lastPanelWidth != panelContainer.Width || _lastPanelHeight != panelContainer.Height || _forceResizeTicks > 0)
+                {
+                    _lastPanelWidth = panelContainer.Width;
+                    _lastPanelHeight = panelContainer.Height;
+                    MoveWindow(_scrcpyProcess.MainWindowHandle, 0, 0, _lastPanelWidth, _lastPanelHeight, true);
+                    if (_forceResizeTicks > 0) _forceResizeTicks--;
+                }
+            }
+        }
+
+        private void VideoSource_NewFrame(object sender, NewFrameEventArgs eventArgs)
+        {
+            if (isRecording)
+            {
+                lock (_writerLock)
+                {
+                    try
+                    {
+                        if (needToOpenWriter)
+                        {
+                            videoWriter = new VideoFileWriter();
+                            // Writes silent video to the Temporary video file
+                            videoWriter.Open(
+                                tempVideoFile,
+                                eventArgs.Frame.Width,
+                                eventArgs.Frame.Height,
+                                25,
+                                VideoCodec.MPEG4,
+                                4000000
+                            );
+
+                            needToOpenWriter = false;
+                        }
+                        if (videoWriter != null && videoWriter.IsOpen)
+                        {
+                            videoWriter.WriteVideoFrame(eventArgs.Frame);
+                        }
+                    }
+                    catch { }
+                }
+            }
+
+            if ((DateTime.Now - _lastUiUpdate).TotalMilliseconds > 66)
+            {
+                _lastUiUpdate = DateTime.Now;
+                Bitmap displayImage = (Bitmap)eventArgs.Frame.Clone();
+
+                try
+                {
+                    pictureBox1.BeginInvoke(new Action(() =>
+                    {
+                        try
+                        {
+                            if (pictureBox1.IsDisposed || pictureBox1.Disposing) { displayImage.Dispose(); return; }
+                            var oldImage = pictureBox1.Image;
+                            pictureBox1.Image = displayImage;
+                            if (oldImage != null) oldImage.Dispose();
+                        }
+                        catch { displayImage.Dispose(); }
+                    }));
+                }
+                catch { displayImage.Dispose(); }
+            }
+        }
+
+        private void WaveIn_DataAvailable(object sender, WaveInEventArgs e)
+        {
+            if (waveWriter != null)
+            {
+                waveWriter.Write(e.Buffer, 0, e.BytesRecorded);
+                waveWriter.Flush();
+            }
+        }
+
+        public void StopScrcpyGracefully()
+        {
+            if (_scrcpyProcess != null && !_scrcpyProcess.HasExited)
+            {
+                try
+                {
+                    SendMessage(_scrcpyProcess.MainWindowHandle, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                    _scrcpyProcess.WaitForExit(3000);
+                    if (!_scrcpyProcess.HasExited) _scrcpyProcess.Kill();
+                }
+                catch { }
+            }
+        }
+
+        private void Form2_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            isRecording = false;
+            if (_scrcpyResizeTimer != null) { _scrcpyResizeTimer.Stop(); _scrcpyResizeTimer.Dispose(); }
+
+            TurnCameraOff();
+
+            lock (_writerLock)
+            {
+                try
+                {
+                    if (videoWriter != null && videoWriter.IsOpen)
+                    {
+                        videoWriter.Close();
+                        videoWriter.Dispose();
+                        videoWriter = null;
+                    }
+                }
+                catch { }
+            }
+
+            // Ensure merging happens if the user closes the window while recording
+            if (!string.IsNullOrEmpty(tempVideoFile) && !string.IsNullOrEmpty(tempAudioFile))
+            {
+                MergeVideoAndAudio(tempVideoFile, tempAudioFile, saveFileName);
+            }
+
+            StopScrcpyGracefully();
+        }
+
+        private static int GetWindowLong(IntPtr hWnd, int nIndex) { return IntPtr.Size == 8 ? (int)GetWindowLongPtr64(hWnd, nIndex) : GetWindowLong32(hWnd, nIndex); }
+        private static IntPtr SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong) { return IntPtr.Size == 8 ? SetWindowLongPtr64(hWnd, nIndex, new IntPtr(dwNewLong)) : new IntPtr(SetWindowLong32(hWnd, nIndex, dwNewLong)); }
+    }
+}

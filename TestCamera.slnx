@@ -1,0 +1,9 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="TestCamera.csproj" Id="e5cbf4c4-4eb4-45ed-8037-d569c640369b">
+    <Platform Solution="*|x64" Project="x64" />
+  </Project>
+</Solution>
