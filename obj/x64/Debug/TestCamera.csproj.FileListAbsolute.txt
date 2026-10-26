@@ -64,13 +64,13 @@ D:\TestCamera\bin\x64\Debug\postproc-54.dll
 D:\TestCamera\bin\x64\Debug\swresample-2.dll
 D:\TestCamera\bin\x64\Debug\swscale-4.dll
 D:\TestCamera\bin\x64\Debug\Accord.dll.config
-D:\TestCamera\bin\x64\Debug\TestCamera.exe.config
-D:\TestCamera\bin\x64\Debug\TestCamera.exe
-D:\TestCamera\bin\x64\Debug\TestCamera.pdb
+D:\TestCamera\bin\x64\Debug\ADB_Logs_Tool.exe.config
+D:\TestCamera\bin\x64\Debug\ADB_Logs_Tool.exe
+D:\TestCamera\bin\x64\Debug\ADB_Logs_Tool.pdb
 D:\TestCamera\bin\x64\Debug\Accord.dll
 D:\TestCamera\bin\x64\Debug\Accord.Video.DirectShow.dll
 D:\TestCamera\bin\x64\Debug\Accord.Video.dll
-D:\TestCamera\bin\x64\Debug\Accord.Video.FFMPEG.dll
+D:\TestCamera\bin\x64\Debug\Accord.Video.FFMPEG.x64.dll
 D:\TestCamera\bin\x64\Debug\BTS.CANDBParser.dll
 D:\TestCamera\bin\x64\Debug\CANDBCXSD.dll
 D:\TestCamera\bin\x64\Debug\LiquidTechnologies.Runtime.Net40.dll
@@ -101,7 +101,7 @@ D:\TestCamera\bin\x64\Debug\System.Security.Principal.Windows.dll
 D:\TestCamera\bin\x64\Debug\Accord.xml
 D:\TestCamera\bin\x64\Debug\Accord.Video.xml
 D:\TestCamera\bin\x64\Debug\Accord.Video.DirectShow.xml
-D:\TestCamera\bin\x64\Debug\Accord.Video.FFMPEG.xml
+D:\TestCamera\bin\x64\Debug\Accord.Video.FFMPEG.x64.xml
 D:\TestCamera\bin\x64\Debug\Microsoft.Win32.Registry.xml
 D:\TestCamera\bin\x64\Debug\NAudio.xml
 D:\TestCamera\bin\x64\Debug\NAudio.Asio.xml
@@ -127,5 +127,5 @@ D:\TestCamera\obj\x64\Debug\TestCamera.Properties.Resources.resources
 D:\TestCamera\obj\x64\Debug\TestCamera.csproj.GenerateResource.cache
 D:\TestCamera\obj\x64\Debug\TestCamera.csproj.CoreCompileInputs.cache
 D:\TestCamera\obj\x64\Debug\TestCamera.csproj.Up2Date
-D:\TestCamera\obj\x64\Debug\TestCamera.exe
-D:\TestCamera\obj\x64\Debug\TestCamera.pdb
+D:\TestCamera\obj\x64\Debug\ADB_Logs_Tool.exe
+D:\TestCamera\obj\x64\Debug\ADB_Logs_Tool.pdb
