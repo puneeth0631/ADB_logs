@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Runtime.CompilerServices; // Added for MethodImplOptions.NoInlining
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -18,6 +19,10 @@ namespace TestCamera
     {
         private string _lastScrcpyFolder = "";
         private string _lastWebcamFolder = "";
+
+        // Tracks if user clicked Cancel/X on Save Dialog so it NEVER asks a second time in the same session
+        private bool _webcamSaveCancelled = false;
+        private bool _scrcpySaveCancelled = false;
 
         // --- WINDOWS API IMPORTS ---
         [DllImport("user32.dll", SetLastError = true)]
@@ -53,21 +58,28 @@ namespace TestCamera
 
         private FilterInfoCollection videoDevices;
         private VideoCaptureDevice videoSource;
-        private VideoFileWriter videoWriter;
+
+        // Stored as 'object' so JIT never loads Accord.Video.FFMPEG.x64 unless Webcam recording actually runs!
+        private object videoWriter;
+
+        // --- Dynamic Resolution Tracking for Webcam ---
+        private int _recordingWidth = 0;
+        private int _recordingHeight = 0;
+        private bool _writerFailed = false;
 
         // --- NAudio Variables ---
         private WaveInEvent waveIn;
         private WaveFileWriter waveWriter;
-        private readonly object _audioLock = new object(); // FIX 4: Thread safety for Audio
+        private readonly object _audioLock = new object();
 
         // --- Anti-Lag Video Variables ---
         private ConcurrentQueue<Bitmap> _videoFrameQueue = new ConcurrentQueue<Bitmap>();
         private CancellationTokenSource _videoWriteTokenSource;
-        private Task _videoSaverTask; // FIX 3: Required to wait for frame queue to empty safely
+        private Task _videoSaverTask;
 
         // --- File Saving Variables ---
         private bool isRecording = false;
-        private bool isStopping = false; // FIX 2: Prevents double triggering
+        private bool isStopping = false;
         private bool needToOpenWriter = false;
         private string saveFileName = "";
         private string tempVideoFile = "";
@@ -127,7 +139,7 @@ namespace TestCamera
             if (this.InvokeRequired) { this.Invoke(new Action(ArrangeLayout)); return; }
 
             bool hasScrcpy = (_scrcpyProcess != null && !_scrcpyProcess.HasExited);
-            bool hasCam = isRecording;
+            bool hasCam = (videoSource != null && videoSource.IsRunning) || isRecording;
 
             if (hasScrcpy && hasCam)
             {
@@ -175,24 +187,28 @@ namespace TestCamera
                 }
             }
 
-            if (waveIn == null)
+            // Only record audio if video saving is active (user did NOT click Cancel)
+            if (isRecording && waveIn == null && !string.IsNullOrEmpty(tempAudioFile))
             {
                 try
                 {
-                    waveIn = new WaveInEvent();
-                    waveIn.WaveFormat = new WaveFormat(44100, 16, 1);
-
-                    if (!string.IsNullOrEmpty(tempAudioFile))
+                    if (WaveInEvent.DeviceCount > 0)
                     {
+                        waveIn = new WaveInEvent();
+                        waveIn.WaveFormat = new WaveFormat(44100, 16, 1);
                         waveWriter = new WaveFileWriter(tempAudioFile, waveIn.WaveFormat);
+                        waveIn.DataAvailable += WaveIn_DataAvailable;
+                        waveIn.StartRecording();
                     }
-
-                    waveIn.DataAvailable += WaveIn_DataAvailable;
-                    waveIn.StartRecording();
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine("Could not start microphone: " + ex.Message);
+                    if (waveIn != null)
+                    {
+                        try { waveIn.Dispose(); } catch { }
+                        waveIn = null;
+                    }
                 }
             }
         }
@@ -219,7 +235,6 @@ namespace TestCamera
                 catch { }
             }
 
-            // FIX 4: Thread-safe disposal of audio writer
             lock (_audioLock)
             {
                 if (waveWriter != null)
@@ -236,6 +251,19 @@ namespace TestCamera
 
         public bool testCamStart(bool isAutoReconnect = false)
         {
+            FilterInfoCollection checkDevices = new FilterInfoCollection(FilterCategory.VideoInputDevice);
+            if (checkDevices.Count == 0)
+            {
+                MessageBox.Show("No webcam detected on this PC!", "Camera Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+
+            // If user already clicked Cancel/X during this session, do NOT ask to save again!
+            if (_webcamSaveCancelled)
+            {
+                return false;
+            }
+
             if (!isAutoReconnect)
             {
                 using (SaveFileDialog sfd = new SaveFileDialog())
@@ -244,8 +272,18 @@ namespace TestCamera
                     sfd.Filter = "MP4 Video File|*.mp4";
                     sfd.FileName = "Webcam_Video_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".mp4";
 
-                    if (sfd.ShowDialog() != DialogResult.OK) return false;
+                    if (sfd.ShowDialog() != DialogResult.OK)
+                    {
+                        // User clicked Cancel or X -> Remember so it NEVER asks again in a loop!
+                        _webcamSaveCancelled = true;
+                        saveFileName = "";
+                        tempVideoFile = "";
+                        tempAudioFile = "";
+                        isRecording = false;
+                        return false;
+                    }
 
+                    _webcamSaveCancelled = false;
                     saveFileName = sfd.FileName;
                     _lastWebcamFolder = Path.GetDirectoryName(saveFileName);
                 }
@@ -257,16 +295,27 @@ namespace TestCamera
             }
 
             string directory = Path.GetDirectoryName(saveFileName);
+            if (!Directory.Exists(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
             string baseName = Path.GetFileNameWithoutExtension(saveFileName);
             tempVideoFile = Path.Combine(directory, baseName + "_TEMP_VIDEO.mp4");
             tempAudioFile = Path.Combine(directory, baseName + "_TEMP_AUDIO.wav");
 
-            TurnCameraOn();
+            while (_videoFrameQueue.TryDequeue(out Bitmap oldFrame))
+            {
+                oldFrame.Dispose();
+            }
+
+            _writerFailed = false;
             needToOpenWriter = true;
             isRecording = true;
             isStopping = false;
 
-            // Start Background Video Saver
+            TurnCameraOn();
+
             _videoWriteTokenSource = new CancellationTokenSource();
             _videoSaverTask = Task.Run(() => BackgroundVideoWriter(_videoWriteTokenSource.Token));
 
@@ -276,8 +325,10 @@ namespace TestCamera
 
         public void testCamStop()
         {
-            // FIX 2: Prevent double triggers
-            if (!isRecording || isStopping) return;
+            // Reset cancel flag when stopped so next fresh manual Start can ask again
+            _webcamSaveCancelled = false;
+
+            if ((!isRecording && videoSource == null) || isStopping) return;
             isStopping = true;
             isRecording = false;
 
@@ -286,7 +337,6 @@ namespace TestCamera
                 _videoWriteTokenSource.Cancel();
             }
 
-            // FIX 3: Wait for the frame queue to completely write to disk before closing stream
             if (_videoSaverTask != null)
             {
                 try { _videoSaverTask.Wait(3000); } catch { }
@@ -298,32 +348,85 @@ namespace TestCamera
             {
                 try
                 {
-                    if (videoWriter != null && videoWriter.IsOpen)
+                    if (videoWriter != null)
                     {
-                        videoWriter.Close();
-                        videoWriter.Dispose();
-                        videoWriter = null;
+                        CloseVideoWriterSafe();
                     }
                 }
                 catch { }
             }
 
-            if (!string.IsNullOrEmpty(tempVideoFile) && !string.IsNullOrEmpty(tempAudioFile))
+            if (!string.IsNullOrEmpty(tempVideoFile))
             {
                 MergeVideoAndAudio(tempVideoFile, tempAudioFile, saveFileName);
-
-                // Erase temp references so they aren't processed twice
                 tempVideoFile = "";
                 tempAudioFile = "";
             }
+
+            isStopping = false;
         }
 
-        // FIX 1: Synchronous UI blocking merge to prevent broken MP4 files if App closes early
+        // Isolated with NoInlining so JIT never loads Accord.Video.FFMPEG.x64 unless needed
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void OpenVideoWriterSafe(string filePath, int width, int height)
+        {
+            var writer = new VideoFileWriter();
+            writer.Open(filePath, width, height, 25, VideoCodec.MPEG4, 4000000);
+            videoWriter = writer;
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void WriteVideoFrameSafe(Bitmap frame)
+        {
+            var writer = videoWriter as VideoFileWriter;
+            if (writer != null && writer.IsOpen)
+            {
+                writer.WriteVideoFrame(frame);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void CloseVideoWriterSafe()
+        {
+            var writer = videoWriter as VideoFileWriter;
+            if (writer != null)
+            {
+                if (writer.IsOpen)
+                {
+                    writer.Close();
+                }
+                writer.Dispose();
+            }
+            videoWriter = null;
+        }
+
         private void MergeVideoAndAudio(string videoPath, string audioPath, string outputPath)
         {
-            if (!File.Exists(videoPath) || !File.Exists(audioPath)) return;
+            if (!File.Exists(videoPath)) return;
 
-            // Use a popup modal to delay environment exit until the MP4 is fully constructed
+            bool hasValidAudio = File.Exists(audioPath) && new FileInfo(audioPath).Length > 100;
+
+            if (!hasValidAudio)
+            {
+                try
+                {
+                    if (File.Exists(outputPath)) File.Delete(outputPath);
+                    File.Move(videoPath, outputPath);
+                    if (File.Exists(audioPath)) File.Delete(audioPath);
+                }
+                catch { }
+                return;
+            }
+
+            string ffmpegExe = "ffmpeg.exe";
+            string localFfmpeg = Path.Combine(Application.StartupPath, "ffmpeg.exe");
+            string scrcpyDirFfmpeg = !string.IsNullOrEmpty(_scrcpyPath)
+                ? Path.Combine(Path.GetDirectoryName(_scrcpyPath), "ffmpeg.exe")
+                : "";
+
+            if (File.Exists(localFfmpeg)) ffmpegExe = localFfmpeg;
+            else if (!string.IsNullOrEmpty(scrcpyDirFfmpeg) && File.Exists(scrcpyDirFfmpeg)) ffmpegExe = scrcpyDirFfmpeg;
+
             using (Form progressForm = new Form())
             {
                 progressForm.Text = "Saving Video";
@@ -332,7 +435,11 @@ namespace TestCamera
                 progressForm.StartPosition = FormStartPosition.CenterScreen;
                 progressForm.ControlBox = false;
 
-                Label lbl = new Label() { Text = "Merging Audio and Video...\nPlease do not close the app.", Location = new Point(20, 20), AutoSize = true };
+                Label lbl = new Label() 
+                {
+                    Text = "Webcam video is saved.", 
+                    Location = new Point(20, 20), AutoSize = true 
+                };
                 progressForm.Controls.Add(lbl);
 
                 progressForm.Shown += async (s, ev) =>
@@ -343,7 +450,7 @@ namespace TestCamera
                         {
                             ProcessStartInfo psi = new ProcessStartInfo
                             {
-                                FileName = "ffmpeg.exe",
+                                FileName = ffmpegExe,
                                 Arguments = $"-y -i \"{videoPath}\" -i \"{audioPath}\" -c:v copy -c:a aac \"{outputPath}\"",
                                 UseShellExecute = false,
                                 CreateNoWindow = true
@@ -359,10 +466,21 @@ namespace TestCamera
                                 File.Delete(videoPath);
                                 File.Delete(audioPath);
                             }
+                            else
+                            {
+                                File.Move(videoPath, outputPath);
+                                if (File.Exists(audioPath)) File.Delete(audioPath);
+                            }
                         }
-                        catch (Exception ex)
+                        catch
                         {
-                            MessageBox.Show("Could not merge audio and video. Please ensure 'ffmpeg.exe' is in your app folder!\n\n" + ex.Message, "Missing FFmpeg");
+                            try
+                            {
+                                if (File.Exists(outputPath)) File.Delete(outputPath);
+                                File.Move(videoPath, outputPath);
+                                if (File.Exists(audioPath)) File.Delete(audioPath);
+                            }
+                            catch { }
                         }
                     });
 
@@ -377,6 +495,12 @@ namespace TestCamera
         {
             string scrcpySavePath = "";
 
+            // If user already clicked Cancel/X on Scrcpy Save Dialog during this session, do not ask again
+            if (_scrcpySaveCancelled)
+            {
+                return false;
+            }
+
             if (!isAutoReconnect)
             {
                 using (SaveFileDialog sfd = new SaveFileDialog())
@@ -385,8 +509,13 @@ namespace TestCamera
                     sfd.Filter = "MP4 Video File|*.mp4";
                     sfd.FileName = "Scrcpy_Video_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".mp4";
 
-                    if (sfd.ShowDialog() != DialogResult.OK) return false;
+                    if (sfd.ShowDialog() != DialogResult.OK)
+                    {
+                        _scrcpySaveCancelled = true;
+                        return false;
+                    }
 
+                    _scrcpySaveCancelled = false;
                     scrcpySavePath = sfd.FileName;
                     _lastScrcpyFolder = Path.GetDirectoryName(scrcpySavePath);
                 }
@@ -397,8 +526,13 @@ namespace TestCamera
                 scrcpySavePath = Path.Combine(_lastScrcpyFolder, "Scrcpy_Video_Reconnect_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".mp4");
             }
 
-            // --- AUTO-DETECT SCRCPY VERSION ---
-            string dynamicArguments = $"-m 1024 --video-bit-rate 2M --max-fps 60 --window-borderless -r \"{scrcpySavePath}\"";
+            string scrcpyDir = Path.GetDirectoryName(scrcpySavePath);
+            if (!Directory.Exists(scrcpyDir))
+            {
+                Directory.CreateDirectory(scrcpyDir);
+            }
+
+            string dynamicArguments = $"--video-bit-rate 2M --max-fps 60 --window-borderless -r \"{scrcpySavePath}\"";
             try
             {
                 ProcessStartInfo versionCheck = new ProcessStartInfo
@@ -415,7 +549,7 @@ namespace TestCamera
                     p.WaitForExit();
                     if (output != null && output.Contains("scrcpy 1."))
                     {
-                        dynamicArguments = $"-m 1024 -b 2M --max-fps 60 --window-borderless -r \"{scrcpySavePath}\"";
+                        dynamicArguments = $"-b 2M --max-fps 60 --window-borderless -r \"{scrcpySavePath}\"";
                     }
                 }
             }
@@ -432,7 +566,8 @@ namespace TestCamera
             };
 
             psi.EnvironmentVariables["ADB"] = _adbPath;
-            psi.WorkingDirectory = System.IO.Path.GetDirectoryName(_scrcpyPath);
+            string workingDir = Path.GetDirectoryName(_scrcpyPath);
+            psi.WorkingDirectory = string.IsNullOrEmpty(workingDir) ? Application.StartupPath : workingDir;
 
             _scrcpyProcess = Process.Start(psi);
             _scrcpyProcess.EnableRaisingEvents = true;
@@ -442,7 +577,6 @@ namespace TestCamera
                 await Task.Delay(100);
                 _scrcpyProcess.Refresh();
 
-                // FIX 5: If Scrcpy crashed because phone disconnected, return false!
                 if (_scrcpyProcess.HasExited) return false;
             }
 
@@ -480,7 +614,7 @@ namespace TestCamera
 
         private void VideoSource_NewFrame(object sender, NewFrameEventArgs eventArgs)
         {
-            if (isRecording)
+            if (isRecording && !_writerFailed)
             {
                 if (_videoFrameQueue.Count < 30)
                 {
@@ -521,18 +655,44 @@ namespace TestCamera
                     {
                         try
                         {
-                            if (needToOpenWriter)
+                            if (needToOpenWriter && !_writerFailed)
                             {
-                                videoWriter = new VideoFileWriter();
-                                videoWriter.Open(tempVideoFile, frame.Width, frame.Height, 25, VideoCodec.MPEG4, 4000000);
+                                _recordingWidth = frame.Width % 2 == 0 ? frame.Width : frame.Width - 1;
+                                _recordingHeight = frame.Height % 2 == 0 ? frame.Height : frame.Height - 1;
+
+                                OpenVideoWriterSafe(tempVideoFile, _recordingWidth, _recordingHeight);
                                 needToOpenWriter = false;
                             }
-                            if (videoWriter != null && videoWriter.IsOpen)
+
+                            if (videoWriter != null && !_writerFailed)
                             {
-                                videoWriter.WriteVideoFrame(frame);
+                                if (frame.Width == _recordingWidth && frame.Height == _recordingHeight)
+                                {
+                                    WriteVideoFrameSafe(frame);
+                                }
+                                else
+                                {
+                                    using (Bitmap resizedFrame = new Bitmap(frame, _recordingWidth, _recordingHeight))
+                                    {
+                                        WriteVideoFrameSafe(resizedFrame);
+                                    }
+                                }
                             }
                         }
-                        catch { }
+                        catch (Exception ex)
+                        {
+                            if (needToOpenWriter)
+                            {
+                                _writerFailed = true;
+                                needToOpenWriter = false;
+                                this.BeginInvoke(new Action(() =>
+                                {
+                                    MessageBox.Show("Video Writer Error on this PC:\n" + ex.Message +
+                                        "\n\nEnsure Platform Target is set to x64 (or Prefer 32-bit is UNCHECKED) in Project Properties -> Build.",
+                                        "Recording Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                                }));
+                            }
+                        }
                     }
                     frame.Dispose();
                 }
@@ -545,7 +705,6 @@ namespace TestCamera
 
         private void WaveIn_DataAvailable(object sender, WaveInEventArgs e)
         {
-            // FIX 4: Prevent App crash by locking object
             lock (_audioLock)
             {
                 if (waveWriter != null)
@@ -558,6 +717,9 @@ namespace TestCamera
 
         public void StopScrcpyGracefully()
         {
+            // Reset cancel flag when stopped so next fresh manual Start can ask again
+            _scrcpySaveCancelled = false;
+
             if (_scrcpyProcess != null && !_scrcpyProcess.HasExited)
             {
                 try
@@ -572,19 +734,35 @@ namespace TestCamera
 
         private void Form2_FormClosing(object sender, FormClosingEventArgs e)
         {
-            // FIX 2: Form Closing uses the EXACT same safe-stop flow to prevent double processing
+            // If Form1 intercepted the UserClosing event (e.Cancel == true), Form1's Stop button will handle stopping safely
+            if (e.Cancel) return;
+
             if (_scrcpyResizeTimer != null)
             {
                 _scrcpyResizeTimer.Stop();
                 _scrcpyResizeTimer.Dispose();
             }
 
-            testCamStop();
+            if (isRecording || videoSource != null)
+            {
+                testCamStop();
+            }
             StopScrcpyGracefully();
         }
 
-        private static int GetWindowLong(IntPtr hWnd, int nIndex) { return IntPtr.Size == 8 ? (int)GetWindowLongPtr64(hWnd, nIndex) : GetWindowLong32(hWnd, nIndex); }
-        private static IntPtr SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong) { return IntPtr.Size == 8 ? SetWindowLongPtr64(hWnd, nIndex, new IntPtr(dwNewLong)) : new IntPtr(SetWindowLong32(hWnd, nIndex, dwNewLong)); }
+        private static int GetWindowLong(IntPtr hWnd, int nIndex)
+        {
+            return IntPtr.Size == 8
+                ? unchecked((int)GetWindowLongPtr64(hWnd, nIndex).ToInt64())
+                : GetWindowLong32(hWnd, nIndex);
+        }
+
+        private static IntPtr SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong)
+        {
+            return IntPtr.Size == 8
+                ? SetWindowLongPtr64(hWnd, nIndex, new IntPtr(unchecked((uint)dwNewLong)))
+                : new IntPtr(SetWindowLong32(hWnd, nIndex, dwNewLong));
+        }
 
         private void label1_Click(object sender, EventArgs e)
         {

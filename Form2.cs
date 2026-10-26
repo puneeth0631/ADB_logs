@@ -1,10 +1,13 @@
 ﻿using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
-using System.Runtime.CompilerServices; // Added for MethodImplOptions.NoInlining
+using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -20,9 +23,13 @@ namespace TestCamera
         private string _lastScrcpyFolder = "";
         private string _lastWebcamFolder = "";
 
-        // Tracks if user clicked Cancel/X on Save Dialog so it NEVER asks a second time in the same session
         private bool _webcamSaveCancelled = false;
         private bool _scrcpySaveCancelled = false;
+
+        // Prevents unexpected Scrcpy exits from stopping the recording session
+        private bool _isManualScrcpyStop = false;
+        private bool _isRestartingScrcpy = false;
+        private bool _isArrangingLayout = false;
 
         // --- WINDOWS API IMPORTS ---
         [DllImport("user32.dll", SetLastError = true)]
@@ -41,12 +48,26 @@ namespace TestCamera
         private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         private static extern IntPtr SendMessage(IntPtr hWnd, UInt32 Msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool PostMessage(IntPtr hWnd, UInt32 Msg, IntPtr wParam, IntPtr lParam);
 
         private const uint WM_CLOSE = 0x0010;
+        private const uint WM_QUIT = 0x0012;
         private const int GWL_STYLE = -16;
+        private const int GWL_EXSTYLE = -20;
+
         private const int WS_CHILD = 0x40000000;
+        private const int WS_POPUP = unchecked((int)0x80000000);
         private const int WS_CAPTION = 0x00C00000;
         private const int WS_THICKFRAME = 0x00040000;
+        private const int WS_BORDER = 0x00800000;
+        private const int WS_DLGFRAME = 0x00400000;
+
+        private const int WS_EX_DLGMODALFRAME = 0x00000001;
+        private const int WS_EX_WINDOWEDGE = 0x00000100;
+        private const int WS_EX_CLIENTEDGE = 0x00000200;
+        private const int WS_EX_STATICEDGE = 0x00020000;
+
         private const uint SWP_NOMOVE = 0x0002;
         private const uint SWP_NOSIZE = 0x0001;
         private const uint SWP_NOZORDER = 0x0004;
@@ -56,28 +77,26 @@ namespace TestCamera
         private string _scrcpyPath;
         private Process _scrcpyProcess;
 
+        // CRITICAL FIX: Store the window handle BEFORE SetParent turns it into a child window!
+        // Otherwise _scrcpyProcess.MainWindowHandle becomes IntPtr.Zero and WM_CLOSE fails to save the MP4!
+        private IntPtr _embeddedScrcpyHwnd = IntPtr.Zero;
+
         private FilterInfoCollection videoDevices;
         private VideoCaptureDevice videoSource;
-
-        // Stored as 'object' so JIT never loads Accord.Video.FFMPEG.x64 unless Webcam recording actually runs!
         private object videoWriter;
 
-        // --- Dynamic Resolution Tracking for Webcam ---
         private int _recordingWidth = 0;
         private int _recordingHeight = 0;
         private bool _writerFailed = false;
 
-        // --- NAudio Variables ---
         private WaveInEvent waveIn;
         private WaveFileWriter waveWriter;
         private readonly object _audioLock = new object();
 
-        // --- Anti-Lag Video Variables ---
         private ConcurrentQueue<Bitmap> _videoFrameQueue = new ConcurrentQueue<Bitmap>();
         private CancellationTokenSource _videoWriteTokenSource;
         private Task _videoSaverTask;
 
-        // --- File Saving Variables ---
         private bool isRecording = false;
         private bool isStopping = false;
         private bool needToOpenWriter = false;
@@ -112,18 +131,23 @@ namespace TestCamera
                 pictureBox1.Parent = this;
                 pictureBox1.SizeMode = PictureBoxSizeMode.Zoom;
                 pictureBox1.BackColor = Color.Black;
+                pictureBox1.BorderStyle = BorderStyle.None;
+                pictureBox1.Margin = new Padding(0);
             }
 
             if (panelContainer != null)
             {
                 panelContainer.Parent = this;
                 panelContainer.BackColor = Color.Black;
+                panelContainer.BorderStyle = BorderStyle.None;
+                panelContainer.Margin = new Padding(0);
+                panelContainer.Padding = new Padding(0);
                 panelContainer.Visible = false;
             }
 
             _scrcpyResizeTimer = new System.Windows.Forms.Timer();
-            _scrcpyResizeTimer.Interval = 200;
-            _scrcpyResizeTimer.Tick += (s, ev) => ResizeEmbeddedWindow();
+            _scrcpyResizeTimer.Interval = 250;
+            _scrcpyResizeTimer.Tick += (s, ev) => ResizeEmbeddedWindow(false);
 
             if (panelContainer != null) panelContainer.Resize += PanelContainer_Resize;
 
@@ -137,42 +161,362 @@ namespace TestCamera
         public void ArrangeLayout()
         {
             if (this.InvokeRequired) { this.Invoke(new Action(ArrangeLayout)); return; }
+            if (_isArrangingLayout) return;
 
-            bool hasScrcpy = (_scrcpyProcess != null && !_scrcpyProcess.HasExited);
-            bool hasCam = (videoSource != null && videoSource.IsRunning) || isRecording;
+            _isArrangingLayout = true;
+            this.SuspendLayout();
+            try
+            {
+                bool hasScrcpy = (_scrcpyProcess != null && !_scrcpyProcess.HasExited) || _isRestartingScrcpy;
+                bool hasCam = (videoSource != null && videoSource.IsRunning) || isRecording;
 
-            if (hasScrcpy && hasCam)
-            {
-                panelContainer.Visible = true;
-                pictureBox1.Visible = true;
-                panelContainer.Dock = DockStyle.Left;
-                panelContainer.Width = this.ClientSize.Width / 2;
-                pictureBox1.Dock = DockStyle.Fill;
-                pictureBox1.BringToFront();
+                if (hasScrcpy && hasCam)
+                {
+                    if (!panelContainer.Visible) panelContainer.Visible = true;
+                    if (!pictureBox1.Visible) pictureBox1.Visible = true;
+                    if (panelContainer.Dock != DockStyle.Left) panelContainer.Dock = DockStyle.Left;
+                    panelContainer.Width = this.ClientSize.Width / 2;
+                    if (pictureBox1.Dock != DockStyle.Fill) pictureBox1.Dock = DockStyle.Fill;
+                    pictureBox1.BringToFront();
+                }
+                else if (hasScrcpy)
+                {
+                    if (pictureBox1.Visible) pictureBox1.Visible = false;
+                    if (!panelContainer.Visible) panelContainer.Visible = true;
+                    if (panelContainer.Dock != DockStyle.Fill) panelContainer.Dock = DockStyle.Fill;
+                    panelContainer.BringToFront();
+                }
+                else if (hasCam)
+                {
+                    if (panelContainer.Visible) panelContainer.Visible = false;
+                    if (!pictureBox1.Visible) pictureBox1.Visible = true;
+                    if (pictureBox1.Dock != DockStyle.Fill) pictureBox1.Dock = DockStyle.Fill;
+                    pictureBox1.BringToFront();
+                }
             }
-            else if (hasScrcpy)
+            finally
             {
-                pictureBox1.Visible = false;
-                panelContainer.Visible = true;
-                panelContainer.Dock = DockStyle.Fill;
-                panelContainer.BringToFront();
-            }
-            else if (hasCam)
-            {
-                panelContainer.Visible = false;
-                pictureBox1.Visible = true;
-                pictureBox1.Dock = DockStyle.Fill;
-                pictureBox1.BringToFront();
+                this.ResumeLayout(true);
+                _isArrangingLayout = false;
             }
         }
 
         private void Form2_Resize(object sender, EventArgs e)
         {
-            ResizeEmbeddedWindow(true);
+            if (_isArrangingLayout) return;
             ArrangeLayout();
+            ResizeEmbeddedWindow(true);
         }
 
-        private void PanelContainer_Resize(object sender, EventArgs e) { ResizeEmbeddedWindow(); }
+        private void PanelContainer_Resize(object sender, EventArgs e)
+        {
+            if (_isArrangingLayout) return;
+            ResizeEmbeddedWindow(true);
+        }
+
+        /// <summary>
+        /// Dynamically detects major version of scrcpy (1, 2, or 3) so flags never conflict
+        /// </summary>
+        private int GetScrcpyMajorVersion(string scrcpyExePath)
+        {
+            if (string.IsNullOrEmpty(scrcpyExePath) || !File.Exists(scrcpyExePath))
+                return 1;
+
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = scrcpyExePath,
+                    Arguments = "--version",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WorkingDirectory = Path.GetDirectoryName(scrcpyExePath)
+                };
+
+                using (Process p = Process.Start(psi))
+                {
+                    string output = p.StandardOutput.ReadToEnd() + " " + p.StandardError.ReadToEnd();
+                    p.WaitForExit(2000);
+
+                    Match m = Regex.Match(output, @"scrcpy\s+(\d+)\.", RegexOptions.IgnoreCase);
+                    if (m.Success && int.TryParse(m.Groups[1].Value, out int major))
+                    {
+                        return major;
+                    }
+                }
+            }
+            catch { }
+
+            if (scrcpyExePath.IndexOf("2.", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                scrcpyExePath.IndexOf("3.", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                scrcpyExePath.IndexOf("EU", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return 2;
+            }
+
+            return 1; // Default to 1.x compatible flags if unknown
+        }
+
+        public async Task<bool> StartAndEmbedScrcpy(bool isAutoReconnect = false)
+        {
+            if (!string.IsNullOrEmpty(ADB_LOGS.scrcpy_path))
+                _scrcpyPath = ADB_LOGS.scrcpy_path;
+            if (!string.IsNullOrEmpty(ADB_LOGS.adbPath))
+                _adbPath = ADB_LOGS.adbPath;
+
+            if (_scrcpySaveCancelled)
+                return false;
+
+            _isManualScrcpyStop = false;
+            string scrcpySavePath = "";
+
+            // 1. Ask where to save BEFORE showing Form2 (so Form2 NEVER appears before clicking Save!)
+            if (!isAutoReconnect)
+            {
+                using (SaveFileDialog sfd = new SaveFileDialog())
+                {
+                    sfd.Title = "Choose where to save the Android video";
+                    sfd.Filter = "MP4 Video File|*.mp4";
+                    sfd.FileName = "Scrcpy_Video_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".mp4";
+
+                    if (sfd.ShowDialog() != DialogResult.OK)
+                    {
+                        _scrcpySaveCancelled = true;
+                        return false;
+                    }
+
+                    _scrcpySaveCancelled = false;
+                    scrcpySavePath = sfd.FileName;
+                    _lastScrcpyFolder = Path.GetDirectoryName(scrcpySavePath);
+                }
+            }
+            else
+            {
+                if (string.IsNullOrEmpty(_lastScrcpyFolder))
+                    _lastScrcpyFolder = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos);
+
+                scrcpySavePath = Path.Combine(_lastScrcpyFolder, "Scrcpy_Video_Reconnect_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".mp4");
+            }
+
+            string scrcpyDir = Path.GetDirectoryName(scrcpySavePath);
+            if (!Directory.Exists(scrcpyDir))
+                Directory.CreateDirectory(scrcpyDir);
+
+            // Detect whether this scrcpy.exe is v1.x (DA2), v2.x (EU), or v3.x
+            int majorVersion = GetScrcpyMajorVersion(_scrcpyPath);
+
+            // Launch Scrcpy off-screen (--window-x -32000 --window-y -32000 --window-borderless)
+            // so the standalone Scrcpy window NEVER flashes on the desktop before embedding!
+            string dynamicArguments = (majorVersion >= 2)
+                ? $"--no-audio -b 2M --render-driver=direct3d --window-borderless --window-x -32000 --window-y -32000 -r \"{scrcpySavePath}\""
+                : $"-b 2M --render-driver=direct3d --window-borderless --window-x -32000 --window-y -32000 -r \"{scrcpySavePath}\"";
+
+            string workingDir = Path.GetDirectoryName(_scrcpyPath);
+            if (string.IsNullOrEmpty(workingDir)) workingDir = Application.StartupPath;
+
+            ProcessStartInfo psi = new ProcessStartInfo
+            {
+                FileName = _scrcpyPath,
+                Arguments = dynamicArguments,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                WorkingDirectory = workingDir
+            };
+
+            if (!string.IsNullOrEmpty(_adbPath) && File.Exists(_adbPath))
+            {
+                psi.EnvironmentVariables["ADB"] = Path.GetFullPath(_adbPath);
+            }
+
+            psi.EnvironmentVariables["SDL_RENDER_DRIVER"] = "direct3d";
+
+            string lastScrcpyError = "";
+
+            _scrcpyProcess = new Process { StartInfo = psi, EnableRaisingEvents = true };
+            _scrcpyProcess.OutputDataReceived += (s, e) => { };
+            _scrcpyProcess.ErrorDataReceived += (s, e) =>
+            {
+                if (!string.IsNullOrWhiteSpace(e.Data))
+                    lastScrcpyError = e.Data;
+            };
+
+            // Watchdog to auto-recover if Scrcpy ever exits unexpectedly mid-recording
+            _scrcpyProcess.Exited += ScrcpyProcess_UnexpectedExitHandler;
+
+            _embeddedScrcpyHwnd = IntPtr.Zero;
+
+            _scrcpyProcess.Start();
+            _scrcpyProcess.BeginOutputReadLine();
+            _scrcpyProcess.BeginErrorReadLine();
+
+            int waitTicks = 0;
+            while (_scrcpyProcess.MainWindowHandle == IntPtr.Zero)
+            {
+                await Task.Delay(80);
+                _scrcpyProcess.Refresh();
+                waitTicks++;
+
+                if (_scrcpyProcess.HasExited || waitTicks > 180)
+                {
+                    if (!isAutoReconnect && !string.IsNullOrEmpty(lastScrcpyError))
+                    {
+                        MessageBox.Show($"ScreenCopy failed to start:\n{lastScrcpyError}\n\nPath: {_scrcpyPath}",
+                            "Scrcpy Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }
+                    return false;
+                }
+            }
+
+            // SAVE HANDLE BEFORE SetParent!
+            _embeddedScrcpyHwnd = _scrcpyProcess.MainWindowHandle;
+
+            // Ensure Form2 & panelContainer handles exist and layout is arranged BEFORE showing Form2
+            if (!this.IsHandleCreated) this.CreateControl();
+            if (!panelContainer.IsHandleCreated) panelContainer.CreateControl();
+
+            ArrangeLayout();
+
+            // Strip ALL borders, captions, frames, and 3D edges so there is ZERO gray line or extra box!
+            int style = GetWindowLong(_embeddedScrcpyHwnd, GWL_STYLE);
+            style = (style & ~WS_POPUP & ~WS_CAPTION & ~WS_THICKFRAME & ~WS_BORDER & ~WS_DLGFRAME) | WS_CHILD;
+
+            int exStyle = GetWindowLong(_embeddedScrcpyHwnd, GWL_EXSTYLE);
+            exStyle &= ~(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE);
+
+            SetParent(_embeddedScrcpyHwnd, panelContainer.Handle);
+            SetWindowLong(_embeddedScrcpyHwnd, GWL_STYLE, style);
+            SetWindowLong(_embeddedScrcpyHwnd, GWL_EXSTYLE, exStyle);
+            SetWindowPos(_embeddedScrcpyHwnd, IntPtr.Zero, 0, 0, panelContainer.ClientSize.Width, panelContainer.ClientSize.Height, SWP_NOZORDER | SWP_FRAMECHANGED);
+
+            // Reset cached panel dimensions and size the embedded window to 100% of panelContainer
+            _lastPanelWidth = 0;
+            _lastPanelHeight = 0;
+            _forceResizeTicks = 3;
+            ResizeEmbeddedWindow(true);
+
+            // Show Form2 once — completely ready and embedded without any flickering!
+            if (!this.Visible)
+            {
+                this.Show();
+            }
+
+            ResizeEmbeddedWindow(true);
+            _scrcpyResizeTimer.Start();
+
+            return true;
+        }
+
+        /// <summary>
+        /// Auto-recovers Scrcpy if the head unit encoder drops frames or exits unexpectedly mid-recording
+        /// </summary>
+        private async void ScrcpyProcess_UnexpectedExitHandler(object sender, EventArgs e)
+        {
+            if (_isManualScrcpyStop || _isRestartingScrcpy || this.IsDisposed || !this.IsHandleCreated)
+                return;
+
+            _isRestartingScrcpy = true;
+            try
+            {
+                await Task.Delay(1500);
+
+                if (_isManualScrcpyStop || this.IsDisposed || !this.IsHandleCreated)
+                    return;
+
+                if (!string.IsNullOrEmpty(_adbPath) && File.Exists(_adbPath))
+                {
+                    ProcessStartInfo psi = new ProcessStartInfo
+                    {
+                        FileName = _adbPath,
+                        Arguments = "devices",
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        CreateNoWindow = true
+                    };
+                    using (Process p = Process.Start(psi))
+                    {
+                        string output = p.StandardOutput.ReadToEnd();
+                        p.WaitForExit(2000);
+                        if (output.Contains("\tdevice") && !_isManualScrcpyStop)
+                        {
+                            this.BeginInvoke(new Action(async () =>
+                            {
+                                if (!_isManualScrcpyStop && !this.IsDisposed)
+                                {
+                                    await StartAndEmbedScrcpy(true);
+                                }
+                            }));
+                        }
+                    }
+                }
+            }
+            catch { }
+            finally
+            {
+                _isRestartingScrcpy = false;
+            }
+        }
+
+        private void ResizeEmbeddedWindow(bool force = false)
+        {
+            if (_scrcpyProcess != null && !_scrcpyProcess.HasExited && _embeddedScrcpyHwnd != IntPtr.Zero)
+            {
+                int currentW = panelContainer.ClientSize.Width;
+                int currentH = panelContainer.ClientSize.Height;
+
+                if (currentW <= 0 || currentH <= 0)
+                    return;
+
+                // Fill 100% of panelContainer (0, 0, currentW, currentH) so no extra sub-box or border line ever appears!
+                if (force || _lastPanelWidth != currentW || _lastPanelHeight != currentH || _forceResizeTicks > 0)
+                {
+                    _lastPanelWidth = currentW;
+                    _lastPanelHeight = currentH;
+
+                    MoveWindow(_embeddedScrcpyHwnd, 0, 0, currentW, currentH, true);
+                    if (_forceResizeTicks > 0) _forceResizeTicks--;
+                }
+            }
+        }
+
+        public void StopScrcpyGracefully()
+        {
+            _isManualScrcpyStop = true;
+            _scrcpySaveCancelled = false;
+
+            if (_scrcpyProcess != null)
+            {
+                try
+                {
+                    _scrcpyProcess.Exited -= ScrcpyProcess_UnexpectedExitHandler;
+
+                    if (!_scrcpyProcess.HasExited)
+                    {
+                        IntPtr targetHwnd = _embeddedScrcpyHwnd != IntPtr.Zero ? _embeddedScrcpyHwnd : _scrcpyProcess.MainWindowHandle;
+
+                        if (targetHwnd != IntPtr.Zero)
+                        {
+                            PostMessage(targetHwnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                        }
+
+                        if (!_scrcpyProcess.WaitForExit(5000))
+                        {
+                            _scrcpyProcess.Kill();
+                        }
+                    }
+                }
+                catch { }
+                finally
+                {
+                    _embeddedScrcpyHwnd = IntPtr.Zero;
+                }
+            }
+        }
+
+        // --- WEBCAM RECORDING LOGIC ---
 
         private void TurnCameraOn()
         {
@@ -187,7 +531,6 @@ namespace TestCamera
                 }
             }
 
-            // Only record audio if video saving is active (user did NOT click Cancel)
             if (isRecording && waveIn == null && !string.IsNullOrEmpty(tempAudioFile))
             {
                 try
@@ -201,9 +544,8 @@ namespace TestCamera
                         waveIn.StartRecording();
                     }
                 }
-                catch (Exception ex)
+                catch
                 {
-                    Console.WriteLine("Could not start microphone: " + ex.Message);
                     if (waveIn != null)
                     {
                         try { waveIn.Dispose(); } catch { }
@@ -258,11 +600,7 @@ namespace TestCamera
                 return false;
             }
 
-            // If user already clicked Cancel/X during this session, do NOT ask to save again!
-            if (_webcamSaveCancelled)
-            {
-                return false;
-            }
+            if (_webcamSaveCancelled) return false;
 
             if (!isAutoReconnect)
             {
@@ -274,7 +612,6 @@ namespace TestCamera
 
                     if (sfd.ShowDialog() != DialogResult.OK)
                     {
-                        // User clicked Cancel or X -> Remember so it NEVER asks again in a loop!
                         _webcamSaveCancelled = true;
                         saveFileName = "";
                         tempVideoFile = "";
@@ -295,19 +632,13 @@ namespace TestCamera
             }
 
             string directory = Path.GetDirectoryName(saveFileName);
-            if (!Directory.Exists(directory))
-            {
-                Directory.CreateDirectory(directory);
-            }
+            if (!Directory.Exists(directory)) Directory.CreateDirectory(directory);
 
             string baseName = Path.GetFileNameWithoutExtension(saveFileName);
             tempVideoFile = Path.Combine(directory, baseName + "_TEMP_VIDEO.mp4");
             tempAudioFile = Path.Combine(directory, baseName + "_TEMP_AUDIO.wav");
 
-            while (_videoFrameQueue.TryDequeue(out Bitmap oldFrame))
-            {
-                oldFrame.Dispose();
-            }
+            while (_videoFrameQueue.TryDequeue(out Bitmap oldFrame)) oldFrame.Dispose();
 
             _writerFailed = false;
             needToOpenWriter = true;
@@ -325,35 +656,20 @@ namespace TestCamera
 
         public void testCamStop()
         {
-            // Reset cancel flag when stopped so next fresh manual Start can ask again
             _webcamSaveCancelled = false;
 
             if ((!isRecording && videoSource == null) || isStopping) return;
             isStopping = true;
             isRecording = false;
 
-            if (_videoWriteTokenSource != null)
-            {
-                _videoWriteTokenSource.Cancel();
-            }
-
-            if (_videoSaverTask != null)
-            {
-                try { _videoSaverTask.Wait(3000); } catch { }
-            }
+            if (_videoWriteTokenSource != null) _videoWriteTokenSource.Cancel();
+            if (_videoSaverTask != null) { try { _videoSaverTask.Wait(3000); } catch { } }
 
             TurnCameraOff();
 
             lock (_writerLock)
             {
-                try
-                {
-                    if (videoWriter != null)
-                    {
-                        CloseVideoWriterSafe();
-                    }
-                }
-                catch { }
+                try { if (videoWriter != null) CloseVideoWriterSafe(); } catch { }
             }
 
             if (!string.IsNullOrEmpty(tempVideoFile))
@@ -366,7 +682,6 @@ namespace TestCamera
             isStopping = false;
         }
 
-        // Isolated with NoInlining so JIT never loads Accord.Video.FFMPEG.x64 unless needed
         [MethodImpl(MethodImplOptions.NoInlining)]
         private void OpenVideoWriterSafe(string filePath, int width, int height)
         {
@@ -379,10 +694,7 @@ namespace TestCamera
         private void WriteVideoFrameSafe(Bitmap frame)
         {
             var writer = videoWriter as VideoFileWriter;
-            if (writer != null && writer.IsOpen)
-            {
-                writer.WriteVideoFrame(frame);
-            }
+            if (writer != null && writer.IsOpen) writer.WriteVideoFrame(frame);
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
@@ -391,10 +703,7 @@ namespace TestCamera
             var writer = videoWriter as VideoFileWriter;
             if (writer != null)
             {
-                if (writer.IsOpen)
-                {
-                    writer.Close();
-                }
+                if (writer.IsOpen) writer.Close();
                 writer.Dispose();
             }
             videoWriter = null;
@@ -405,7 +714,6 @@ namespace TestCamera
             if (!File.Exists(videoPath)) return;
 
             bool hasValidAudio = File.Exists(audioPath) && new FileInfo(audioPath).Length > 100;
-
             if (!hasValidAudio)
             {
                 try
@@ -418,11 +726,11 @@ namespace TestCamera
                 return;
             }
 
+            if (!string.IsNullOrEmpty(ADB_LOGS.scrcpy_path)) _scrcpyPath = ADB_LOGS.scrcpy_path;
+
             string ffmpegExe = "ffmpeg.exe";
             string localFfmpeg = Path.Combine(Application.StartupPath, "ffmpeg.exe");
-            string scrcpyDirFfmpeg = !string.IsNullOrEmpty(_scrcpyPath)
-                ? Path.Combine(Path.GetDirectoryName(_scrcpyPath), "ffmpeg.exe")
-                : "";
+            string scrcpyDirFfmpeg = !string.IsNullOrEmpty(_scrcpyPath) ? Path.Combine(Path.GetDirectoryName(_scrcpyPath), "ffmpeg.exe") : "";
 
             if (File.Exists(localFfmpeg)) ffmpegExe = localFfmpeg;
             else if (!string.IsNullOrEmpty(scrcpyDirFfmpeg) && File.Exists(scrcpyDirFfmpeg)) ffmpegExe = scrcpyDirFfmpeg;
@@ -435,11 +743,7 @@ namespace TestCamera
                 progressForm.StartPosition = FormStartPosition.CenterScreen;
                 progressForm.ControlBox = false;
 
-                Label lbl = new Label() 
-                {
-                    Text = "Webcam video is saved.", 
-                    Location = new Point(20, 20), AutoSize = true 
-                };
+                Label lbl = new Label() { Text = "Webcam video is saved.", Location = new Point(20, 20), AutoSize = true };
                 progressForm.Controls.Add(lbl);
 
                 progressForm.Shown += async (s, ev) =>
@@ -455,22 +759,10 @@ namespace TestCamera
                                 UseShellExecute = false,
                                 CreateNoWindow = true
                             };
+                            using (Process p = Process.Start(psi)) { p.WaitForExit(); }
 
-                            using (Process p = Process.Start(psi))
-                            {
-                                p.WaitForExit();
-                            }
-
-                            if (File.Exists(outputPath))
-                            {
-                                File.Delete(videoPath);
-                                File.Delete(audioPath);
-                            }
-                            else
-                            {
-                                File.Move(videoPath, outputPath);
-                                if (File.Exists(audioPath)) File.Delete(audioPath);
-                            }
+                            if (File.Exists(outputPath)) { File.Delete(videoPath); File.Delete(audioPath); }
+                            else { File.Move(videoPath, outputPath); if (File.Exists(audioPath)) File.Delete(audioPath); }
                         }
                         catch
                         {
@@ -483,150 +775,21 @@ namespace TestCamera
                             catch { }
                         }
                     });
-
                     if (progressForm.IsHandleCreated) progressForm.Close();
                 };
-
                 progressForm.ShowDialog(this);
-            }
-        }
-
-        public async Task<bool> StartAndEmbedScrcpy(bool isAutoReconnect = false)
-        {
-            string scrcpySavePath = "";
-
-            // If user already clicked Cancel/X on Scrcpy Save Dialog during this session, do not ask again
-            if (_scrcpySaveCancelled)
-            {
-                return false;
-            }
-
-            if (!isAutoReconnect)
-            {
-                using (SaveFileDialog sfd = new SaveFileDialog())
-                {
-                    sfd.Title = "Choose where to save the Android video";
-                    sfd.Filter = "MP4 Video File|*.mp4";
-                    sfd.FileName = "Scrcpy_Video_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".mp4";
-
-                    if (sfd.ShowDialog() != DialogResult.OK)
-                    {
-                        _scrcpySaveCancelled = true;
-                        return false;
-                    }
-
-                    _scrcpySaveCancelled = false;
-                    scrcpySavePath = sfd.FileName;
-                    _lastScrcpyFolder = Path.GetDirectoryName(scrcpySavePath);
-                }
-            }
-            else
-            {
-                if (string.IsNullOrEmpty(_lastScrcpyFolder)) _lastScrcpyFolder = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos);
-                scrcpySavePath = Path.Combine(_lastScrcpyFolder, "Scrcpy_Video_Reconnect_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".mp4");
-            }
-
-            string scrcpyDir = Path.GetDirectoryName(scrcpySavePath);
-            if (!Directory.Exists(scrcpyDir))
-            {
-                Directory.CreateDirectory(scrcpyDir);
-            }
-
-            string dynamicArguments = $"--video-bit-rate 2M --max-fps 60 --window-borderless -r \"{scrcpySavePath}\"";
-            try
-            {
-                ProcessStartInfo versionCheck = new ProcessStartInfo
-                {
-                    FileName = _scrcpyPath,
-                    Arguments = "--version",
-                    RedirectStandardOutput = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
-                using (Process p = Process.Start(versionCheck))
-                {
-                    string output = p.StandardOutput.ReadLine();
-                    p.WaitForExit();
-                    if (output != null && output.Contains("scrcpy 1."))
-                    {
-                        dynamicArguments = $"-b 2M --max-fps 60 --window-borderless -r \"{scrcpySavePath}\"";
-                    }
-                }
-            }
-            catch { }
-
-            ProcessStartInfo psi = new ProcessStartInfo
-            {
-                FileName = _scrcpyPath,
-                Arguments = dynamicArguments,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden,
-                RedirectStandardError = true
-            };
-
-            psi.EnvironmentVariables["ADB"] = _adbPath;
-            string workingDir = Path.GetDirectoryName(_scrcpyPath);
-            psi.WorkingDirectory = string.IsNullOrEmpty(workingDir) ? Application.StartupPath : workingDir;
-
-            _scrcpyProcess = Process.Start(psi);
-            _scrcpyProcess.EnableRaisingEvents = true;
-
-            while (_scrcpyProcess.MainWindowHandle == IntPtr.Zero)
-            {
-                await Task.Delay(100);
-                _scrcpyProcess.Refresh();
-
-                if (_scrcpyProcess.HasExited) return false;
-            }
-
-            await Task.Delay(200);
-            IntPtr hwnd = _scrcpyProcess.MainWindowHandle;
-
-            int style = GetWindowLong(hwnd, GWL_STYLE);
-            style = (style & ~WS_CAPTION & ~WS_THICKFRAME) | WS_CHILD;
-
-            SetParent(hwnd, panelContainer.Handle);
-            SetWindowLong(hwnd, GWL_STYLE, style);
-            SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
-
-            _forceResizeTicks = 25;
-            ResizeEmbeddedWindow(true);
-            _scrcpyResizeTimer.Start();
-
-            ArrangeLayout();
-            return true;
-        }
-
-        private void ResizeEmbeddedWindow(bool force = false)
-        {
-            if (_scrcpyProcess != null && !_scrcpyProcess.HasExited && _scrcpyProcess.MainWindowHandle != IntPtr.Zero)
-            {
-                if (force || _lastPanelWidth != panelContainer.Width || _lastPanelHeight != panelContainer.Height || _forceResizeTicks > 0)
-                {
-                    _lastPanelWidth = panelContainer.Width;
-                    _lastPanelHeight = panelContainer.Height;
-                    MoveWindow(_scrcpyProcess.MainWindowHandle, 0, 0, _lastPanelWidth, _lastPanelHeight, true);
-                    if (_forceResizeTicks > 0) _forceResizeTicks--;
-                }
             }
         }
 
         private void VideoSource_NewFrame(object sender, NewFrameEventArgs eventArgs)
         {
-            if (isRecording && !_writerFailed)
-            {
-                if (_videoFrameQueue.Count < 30)
-                {
-                    _videoFrameQueue.Enqueue((Bitmap)eventArgs.Frame.Clone());
-                }
-            }
+            if (isRecording && !_writerFailed && _videoFrameQueue.Count < 30)
+                _videoFrameQueue.Enqueue((Bitmap)eventArgs.Frame.Clone());
 
             if ((DateTime.Now - _lastUiUpdate).TotalMilliseconds > 66)
             {
                 _lastUiUpdate = DateTime.Now;
                 Bitmap displayImage = (Bitmap)eventArgs.Frame.Clone();
-
                 try
                 {
                     pictureBox1.BeginInvoke(new Action(() =>
@@ -659,7 +822,6 @@ namespace TestCamera
                             {
                                 _recordingWidth = frame.Width % 2 == 0 ? frame.Width : frame.Width - 1;
                                 _recordingHeight = frame.Height % 2 == 0 ? frame.Height : frame.Height - 1;
-
                                 OpenVideoWriterSafe(tempVideoFile, _recordingWidth, _recordingHeight);
                                 needToOpenWriter = false;
                             }
@@ -667,15 +829,11 @@ namespace TestCamera
                             if (videoWriter != null && !_writerFailed)
                             {
                                 if (frame.Width == _recordingWidth && frame.Height == _recordingHeight)
-                                {
                                     WriteVideoFrameSafe(frame);
-                                }
                                 else
                                 {
                                     using (Bitmap resizedFrame = new Bitmap(frame, _recordingWidth, _recordingHeight))
-                                    {
                                         WriteVideoFrameSafe(resizedFrame);
-                                    }
                                 }
                             }
                         }
@@ -687,19 +845,14 @@ namespace TestCamera
                                 needToOpenWriter = false;
                                 this.BeginInvoke(new Action(() =>
                                 {
-                                    MessageBox.Show("Video Writer Error on this PC:\n" + ex.Message +
-                                        "\n\nEnsure Platform Target is set to x64 (or Prefer 32-bit is UNCHECKED) in Project Properties -> Build.",
-                                        "Recording Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                                    MessageBox.Show("Video Writer Error:\n" + ex.Message, "Recording Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                                 }));
                             }
                         }
                     }
                     frame.Dispose();
                 }
-                else
-                {
-                    Thread.Sleep(5);
-                }
+                else Thread.Sleep(5);
             }
         }
 
@@ -715,26 +868,8 @@ namespace TestCamera
             }
         }
 
-        public void StopScrcpyGracefully()
-        {
-            // Reset cancel flag when stopped so next fresh manual Start can ask again
-            _scrcpySaveCancelled = false;
-
-            if (_scrcpyProcess != null && !_scrcpyProcess.HasExited)
-            {
-                try
-                {
-                    SendMessage(_scrcpyProcess.MainWindowHandle, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
-                    _scrcpyProcess.WaitForExit(3000);
-                    if (!_scrcpyProcess.HasExited) _scrcpyProcess.Kill();
-                }
-                catch { }
-            }
-        }
-
         private void Form2_FormClosing(object sender, FormClosingEventArgs e)
         {
-            // If Form1 intercepted the UserClosing event (e.Cancel == true), Form1's Stop button will handle stopping safely
             if (e.Cancel) return;
 
             if (_scrcpyResizeTimer != null)
@@ -743,10 +878,7 @@ namespace TestCamera
                 _scrcpyResizeTimer.Dispose();
             }
 
-            if (isRecording || videoSource != null)
-            {
-                testCamStop();
-            }
+            if (isRecording || videoSource != null) testCamStop();
             StopScrcpyGracefully();
         }
 
@@ -764,9 +896,6 @@ namespace TestCamera
                 : new IntPtr(SetWindowLong32(hWnd, nIndex, dwNewLong));
         }
 
-        private void label1_Click(object sender, EventArgs e)
-        {
-
-        }
+        private void label1_Click(object sender, EventArgs e) { }
     }
 }

@@ -7,19 +7,19 @@
       "RelativeMoniker": "D:0:0:{E5CBF4C4-4EB4-45ED-8037-D569C640369B}|TestCamera.csproj|solutionrelative:adb_logs.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
     },
     {
-      "AbsoluteMoniker": "D:0:0:{E5CBF4C4-4EB4-45ED-8037-D569C640369B}|TestCamera.csproj|D:\\TestCamera\\adb_logs.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}|Form",
-      "RelativeMoniker": "D:0:0:{E5CBF4C4-4EB4-45ED-8037-D569C640369B}|TestCamera.csproj|solutionrelative:adb_logs.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}|Form"
-    },
-    {
       "AbsoluteMoniker": "D:0:0:{E5CBF4C4-4EB4-45ED-8037-D569C640369B}|TestCamera.csproj|D:\\TestCamera\\form2.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
       "RelativeMoniker": "D:0:0:{E5CBF4C4-4EB4-45ED-8037-D569C640369B}|TestCamera.csproj|solutionrelative:form2.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
     },
     {
-      "AbsoluteMoniker": "D:0:0:{00000000-0000-0000-0000-000000000000}|\u003CSolution\u003E|TestCamera||{04B8AB82-A572-4FEF-95CE-5222444B6B64}|"
-    },
-    {
       "AbsoluteMoniker": "D:0:0:{E5CBF4C4-4EB4-45ED-8037-D569C640369B}|TestCamera.csproj|D:\\TestCamera\\form2.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}|Form",
       "RelativeMoniker": "D:0:0:{E5CBF4C4-4EB4-45ED-8037-D569C640369B}|TestCamera.csproj|solutionrelative:form2.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}|Form"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{E5CBF4C4-4EB4-45ED-8037-D569C640369B}|TestCamera.csproj|D:\\TestCamera\\adb_logs.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}|Form",
+      "RelativeMoniker": "D:0:0:{E5CBF4C4-4EB4-45ED-8037-D569C640369B}|TestCamera.csproj|solutionrelative:adb_logs.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}|Form"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{00000000-0000-0000-0000-000000000000}|\u003CSolution\u003E|TestCamera||{04B8AB82-A572-4FEF-95CE-5222444B6B64}|"
     },
     {
       "AbsoluteMoniker": "D:0:0:{E5CBF4C4-4EB4-45ED-8037-D569C640369B}|TestCamera.csproj|D:\\TestCamera\\form2.designer.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
@@ -28,9 +28,6 @@
     {
       "AbsoluteMoniker": "D:0:0:{E5CBF4C4-4EB4-45ED-8037-D569C640369B}|TestCamera.csproj|D:\\TestCamera\\adb_logs.designer.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
       "RelativeMoniker": "D:0:0:{E5CBF4C4-4EB4-45ED-8037-D569C640369B}|TestCamera.csproj|solutionrelative:adb_logs.designer.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
-    },
-    {
-      "AbsoluteMoniker": "D:0:0:{E5CBF4C4-4EB4-45ED-8037-D569C640369B}|TestCamera.csproj|d:\\testcamera\\||{B270807C-D8C6-49EB-8EBE-8E8D566637A1}|5e9a8ac2-4f34-4521-858f-4c248ba31532"
     }
   ],
   "DocumentGroupContainers": [
@@ -44,7 +41,7 @@
           "Children": [
             {
               "$type": "Document",
-              "DocumentIndex": 4,
+              "DocumentIndex": 2,
               "Title": "Form2.cs [Design]",
               "DocumentMoniker": "D:\\TestCamera\\Form2.cs",
               "RelativeDocumentMoniker": "Form2.cs",
@@ -57,28 +54,27 @@
             },
             {
               "$type": "Document",
-              "DocumentIndex": 2,
+              "DocumentIndex": 1,
               "Title": "Form2.cs",
               "DocumentMoniker": "D:\\TestCamera\\Form2.cs",
               "RelativeDocumentMoniker": "Form2.cs",
               "ToolTip": "D:\\TestCamera\\Form2.cs",
               "RelativeToolTip": "Form2.cs",
-              "ViewState": "AgIAAKgCAAAAAAAAAAAowAMDAAABAAAAAAAAAA==",
+              "ViewState": "AgIAAEUDAAAAAAAAAAAAwIQDAAABAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
               "WhenOpened": "2026-05-05T05:26:32.148Z",
               "EditorCaption": ""
             },
             {
               "$type": "Document",
-              "DocumentIndex": 3,
+              "DocumentIndex": 4,
               "Title": "TestCamera",
               "DocumentMoniker": "D:\\TestCamera\\TestCamera.csproj",
               "RelativeDocumentMoniker": "TestCamera.csproj",
               "ToolTip": "D:\\TestCamera\\TestCamera.csproj",
               "RelativeToolTip": "TestCamera.csproj",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001001|",
-              "WhenOpened": "2026-10-23T09:02:42.553Z",
-              "EditorCaption": ""
+              "WhenOpened": "2026-10-23T09:02:42.553Z"
             },
             {
               "$type": "Document",
@@ -88,14 +84,14 @@
               "RelativeDocumentMoniker": "ADB_LOGS.cs",
               "ToolTip": "D:\\TestCamera\\ADB_LOGS.cs",
               "RelativeToolTip": "ADB_LOGS.cs",
-              "ViewState": "AgIAAFwGAAAAAAAAAAA7wLEGAAABAAAAAAAAAA==",
+              "ViewState": "AgIAABkFAAAAAAAAAAD4v1sFAAARAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
               "WhenOpened": "2026-05-04T10:13:07.854Z",
               "EditorCaption": ""
             },
             {
               "$type": "Document",
-              "DocumentIndex": 1,
+              "DocumentIndex": 3,
               "Title": "ADB_LOGS.cs [Design]",
               "DocumentMoniker": "D:\\TestCamera\\ADB_LOGS.cs",
               "RelativeDocumentMoniker": "ADB_LOGS.cs",

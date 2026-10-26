@@ -24,6 +24,9 @@ namespace TestCamera
         public static bool deviceFlag = true;
         public static bool skipScrcpy = false;
 
+        // Tracks if user clicked Cancel/X on video save so ONLY logs run & save
+        private bool _videoRecordingCancelledByUser = false;
+
         private Process adbLogProcess = null;
         private Process kernelLogProcess = null;
 
@@ -80,6 +83,9 @@ namespace TestCamera
         {
             InitializeComponent();
             this.Text = "ADB LOGS";
+
+            // Resolve full paths for adb.exe and scrcpy.exe inside the installed application folder
+            ResolveToolPaths();
 
             panel1.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             panel2.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
@@ -155,6 +161,23 @@ namespace TestCamera
             _ = LoadDeviceIdAsync();
         }
 
+        private void ResolveToolPaths()
+        {
+            string startupDir = Application.StartupPath;
+
+            string localAdb = Path.Combine(startupDir, "adb.exe");
+            if (File.Exists(localAdb))
+            {
+                adbPath = localAdb;
+            }
+
+            string localScrcpy = Path.Combine(startupDir, "scrcpy.exe");
+            if (File.Exists(localScrcpy))
+            {
+                scrcpy_path = localScrcpy;
+            }
+        }
+
         private void BroadcastSystemMessage(string message, Color color, string level = "I")
         {
             LogLine sysMsg = new LogLine
@@ -175,25 +198,33 @@ namespace TestCamera
 
         public bool CheckDevice(bool isAutoReconnect = false)
         {
-            videoDevices = new FilterInfoCollection(FilterCategory.VideoInputDevice);
-            if (videoDevices.Count == 0)
+            try
+            {
+                videoDevices = new FilterInfoCollection(FilterCategory.VideoInputDevice);
+                if (videoDevices.Count == 0)
+                {
+                    deviceFlag = false;
+                    if (!isAutoReconnect)
+                    {
+                        DialogResult res = MessageBox.Show(
+                            "No camera detected!\n\n• Click OK to continue for ScreenCopy\n• Click Cancel (or 'X') to run ADB Logs ONLY",
+                            "Camera Missing",
+                            MessageBoxButtons.OKCancel,
+                            MessageBoxIcon.Information);
+
+                        skipScrcpy = (res != DialogResult.OK);
+                    }
+                    return false;
+                }
+                deviceFlag = true;
+                skipScrcpy = false;
+                return true;
+            }
+            catch
             {
                 deviceFlag = false;
-                if (!isAutoReconnect)
-                {
-                    DialogResult res = MessageBox.Show(
-                        "No camera detected!\n\n• Click OK to continue for ScreenCopy\n• Click Cancel (or 'X') to run ADB Logs ONLY",
-                        "Camera Missing",
-                        MessageBoxButtons.OKCancel,
-                        MessageBoxIcon.Information);
-
-                    skipScrcpy = (res != DialogResult.OK);
-                }
                 return false;
             }
-            deviceFlag = true;
-            skipScrcpy = false;
-            return true;
         }
 
         private void ClearAllBuffers()
@@ -852,6 +883,7 @@ namespace TestCamera
             if (!isDisconnect)
             {
                 hasStartedManually = false;
+                _videoRecordingCancelledByUser = false;
             }
 
             _isPaused = true;
@@ -888,6 +920,7 @@ namespace TestCamera
             {
                 if (!hasStartedManually)
                 {
+                    _videoRecordingCancelledByUser = false;
                     currentView = LogView.ADB;
                     guna2GridLogs.Visible = true;
 
@@ -901,6 +934,7 @@ namespace TestCamera
                     await RunADBAsync("wait-for-device", 5000);
 
                     await RunADBAsync("shell setprop persist.log.tag DEBUG");
+                    BroadcastSystemMessage("SYSTEM: adb shell setprop persist.log.tag DEBUG (Applied)", Color.DeepSkyBlue);
 
                     await RunADBAsync("logcat -G 16M");
                     await RunADBAsync("logcat -P \"\"");
@@ -909,8 +943,6 @@ namespace TestCamera
                     await RunADBAsync("shell setprop log.tag.VehicleHal VERBOSE");
                     await RunADBAsync("shell setprop log.tag.CarService VERBOSE");
                     await RunADBAsync("shell setprop log.tag.VehicleProperty VERBOSE");
-
-                    
 
                     hasStartedManually = true;
                     _isPaused = false;
@@ -944,14 +976,27 @@ namespace TestCamera
                 if (hasCamera)
                 {
                     camStarted = form2.testCamStart();
+                    if (!camStarted)
+                    {
+                        // User clicked Cancel or X on Webcam Save Dialog -> Do NOT ask again, run Logs ONLY!
+                        _videoRecordingCancelledByUser = true;
+                        skipScrcpy = true;
+                    }
                 }
                 else if (!skipScrcpy)
                 {
                     scrcpyStarted = await form2.StartAndEmbedScrcpy();
+                    if (!scrcpyStarted)
+                    {
+                        // User clicked Cancel or X on Scrcpy Save Dialog -> Do NOT ask again, run Logs ONLY!
+                        _videoRecordingCancelledByUser = true;
+                        skipScrcpy = true;
+                    }
                 }
 
                 if (camStarted || scrcpyStarted)
                 {
+                    form2.ArrangeLayout();
                     form2.Show();
                 }
                 else
@@ -985,58 +1030,212 @@ namespace TestCamera
             AutoSaveAllLogsToZip();
         }
 
-        // ==========================================
-        // 🛠 FIX #2: TIMEOUT FOR BUGREPORT FREEZES
-        // ==========================================
+        // =========================================================================
+        // 🛠 FIX #2: COMPLETE, UNCORRUPTED BUGREPORT GENERATION & EXTRACTION FIX
+        // =========================================================================
         public async Task<string> RunAdbBugReportAsync(string savePath)
         {
-            string result = "";
+            string result = "Success";
+
+            try { if (File.Exists(savePath)) File.Delete(savePath); } catch { }
+
             using (Form progressForm = new Form())
             {
-                progressForm.Text = "Please Wait";
-                progressForm.Size = new Size(350, 140);
+                progressForm.Text = "Generating Android Bug Report";
+                progressForm.Size = new Size(420, 160);
                 progressForm.FormBorderStyle = FormBorderStyle.FixedDialog;
                 progressForm.StartPosition = FormStartPosition.CenterParent;
                 progressForm.ControlBox = false;
+                progressForm.TopMost = true;
 
-                Label lbl = new Label() { Text = "Generating Bug Report...\nThis may take 2 to 5 minutes.", Location = new Point(20, 15), AutoSize = true };
-                ProgressBar pBar = new ProgressBar() { Style = ProgressBarStyle.Marquee, Location = new Point(20, 55), Size = new Size(290, 25) };
-                progressForm.Controls.Add(lbl); progressForm.Controls.Add(pBar);
-
-                progressForm.Load += (s, e) =>
+                Label lbl = new Label()
                 {
-                    _ = Task.Run(async () =>
+                    Text = "Generating Bug Report... Please wait (2 to 5 mins).\nDo NOT disconnect the device.\nStarting dumpstate...",
+                    Location = new Point(20, 15),
+                    AutoSize = true
+                };
+                ProgressBar pBar = new ProgressBar()
+                {
+                    Style = ProgressBarStyle.Marquee,
+                    Location = new Point(20, 80),
+                    Size = new Size(365, 25)
+                };
+                progressForm.Controls.Add(lbl);
+                progressForm.Controls.Add(pBar);
+
+                progressForm.Shown += async (s, e) =>
+                {
+                    await Task.Run(() =>
                     {
+                        string tempBugDir = Path.Combine(Path.GetTempPath(), "AdbBugReport_" + Guid.NewGuid().ToString("N"));
                         try
                         {
-                            using (Process process = CreateProcess(adbPath, $"bugreport \"{savePath}\""))
+                            Directory.CreateDirectory(tempBugDir);
+
+                            ProcessStartInfo psi = new ProcessStartInfo
                             {
+                                FileName = adbPath,
+                                Arguments = $"bugreport \"{tempBugDir}\"",
+                                UseShellExecute = false,
+                                CreateNoWindow = true,
+                                RedirectStandardOutput = true,
+                                RedirectStandardError = true
+                            };
+
+                            string lastError = "";
+
+                            using (Process process = new Process { StartInfo = psi })
+                            {
+                                DataReceivedEventHandler outputHandler = (senderObj, args) =>
+                                {
+                                    if (!string.IsNullOrWhiteSpace(args.Data))
+                                    {
+                                        string line = args.Data.Trim();
+                                        if (progressForm.IsHandleCreated)
+                                        {
+                                            try
+                                            {
+                                                progressForm.BeginInvoke(new Action(() =>
+                                                {
+                                                    lbl.Text = "Generating Bug Report... Please wait.\n" +
+                                                               (line.Length > 55 ? line.Substring(0, 55) + "..." : line);
+                                                }));
+                                            }
+                                            catch { }
+                                        }
+                                    }
+                                };
+
+                                process.OutputDataReceived += outputHandler;
+                                process.ErrorDataReceived += (senderObj, args) =>
+                                {
+                                    if (!string.IsNullOrWhiteSpace(args.Data))
+                                    {
+                                        lastError = args.Data.Trim();
+                                        outputHandler(senderObj, args);
+                                    }
+                                };
+
                                 process.Start();
+                                process.BeginOutputReadLine();
+                                process.BeginErrorReadLine();
 
-                                Task<string> readErrTask = process.StandardError.ReadToEndAsync();
-                                Task<string> readOutTask = process.StandardOutput.ReadToEndAsync();
-
-                                // FIX 2: If the device hangs, don't wait forever! Allow max 5 minutes
-                                if (!process.WaitForExit(300000))
+                                // Allow up to 10 minutes (600,000 ms)
+                                if (!process.WaitForExit(600000))
                                 {
                                     try { process.Kill(); } catch { }
-                                    result = "Error: Bug report timed out after 5 minutes. Device might be frozen.";
-                                    return;
+                                    result = "Error: Bug report timed out after 10 minutes. Device might be frozen.";
+                                }
+                                else
+                                {
+                                    // Flush all remaining async output events
+                                    process.WaitForExit();
+                                }
+                            }
+
+                            // Allow OS 1 second to completely release file locks
+                            System.Threading.Thread.Sleep(1000);
+
+                            if (result == "Success")
+                            {
+                                string generatedZip = Directory.GetFiles(tempBugDir, "*.zip").FirstOrDefault();
+                                if (string.IsNullOrEmpty(generatedZip))
+                                {
+                                    generatedZip = Directory.GetFiles(tempBugDir).FirstOrDefault();
                                 }
 
-                                string readOut = await readOutTask;
-                                string readErr = await readErrTask;
+                                if (!string.IsNullOrEmpty(generatedZip) && new FileInfo(generatedZip).Length > 0)
+                                {
+                                    if (progressForm.IsHandleCreated)
+                                    {
+                                        try
+                                        {
+                                            progressForm.BeginInvoke(new Action(() =>
+                                            {
+                                                lbl.Text = "Finalizing ZIP archive for Windows extraction...\nPlease wait...";
+                                            }));
+                                        }
+                                        catch { }
+                                    }
 
-                                result = (readOut + " " + readErr).Trim();
+                                    // Repackage cleanly without Linux symlink attributes so 7-Zip / Windows Extract All never gets stuck!
+                                    SanitizeBugReportZipForWindows(generatedZip, savePath);
+                                }
+                                else
+                                {
+                                    result = "Error: ADB finished but did not produce a valid zip file. " + lastError;
+                                }
                             }
                         }
-                        catch (Exception ex) { result = "Error: " + ex.Message; }
-                        finally { if (progressForm.IsHandleCreated) progressForm.Invoke(new Action(() => progressForm.Close())); }
+                        catch (Exception ex)
+                        {
+                            result = "Error: " + ex.Message;
+                        }
+                        finally
+                        {
+                            try { if (Directory.Exists(tempBugDir)) Directory.Delete(tempBugDir, true); } catch { }
+                        }
                     });
+
+                    if (progressForm.IsHandleCreated)
+                        progressForm.Close();
                 };
+
                 progressForm.ShowDialog(this);
             }
             return result;
+        }
+
+        /// <summary>
+        /// Copies all standard files from the Android bugreport zip into a clean Windows-compatible zip,
+        /// stripping Unix symlink external attributes that cause 7-Zip to halt with "Cannot create symbolic link".
+        /// </summary>
+        private void SanitizeBugReportZipForWindows(string rawAndroidZipPath, string finalWindowsZipPath)
+        {
+            try
+            {
+                if (File.Exists(finalWindowsZipPath)) File.Delete(finalWindowsZipPath);
+
+                using (FileStream sourceStream = new FileStream(rawAndroidZipPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                using (ZipArchive sourceArchive = new ZipArchive(sourceStream, ZipArchiveMode.Read))
+                using (FileStream destStream = new FileStream(finalWindowsZipPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                using (ZipArchive destArchive = new ZipArchive(destStream, ZipArchiveMode.Create))
+                {
+                    HashSet<string> addedEntries = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                    foreach (ZipArchiveEntry entry in sourceArchive.Entries)
+                    {
+                        if (string.IsNullOrEmpty(entry.Name)) continue;
+
+                        // Check Unix mode in upper 16 bits of ExternalAttributes: 0xA000 is S_IFLNK (Linux Symbolic Link)
+                        int unixFileType = (entry.ExternalAttributes >> 16) & 0xF000;
+                        if (unixFileType == 0xA000)
+                        {
+                            // Skip Linux symbolic link entries that cause 7-Zip extraction errors on Windows
+                            continue;
+                        }
+
+                        string cleanFullName = entry.FullName.Replace('\\', '/').TrimStart('/');
+                        if (string.IsNullOrEmpty(cleanFullName) || !addedEntries.Add(cleanFullName))
+                            continue;
+
+                        ZipArchiveEntry newEntry = destArchive.CreateEntry(cleanFullName, CompressionLevel.Fastest);
+                        newEntry.LastWriteTime = entry.LastWriteTime;
+
+                        using (Stream inStream = entry.Open())
+                        using (Stream outStream = newEntry.Open())
+                        {
+                            inStream.CopyTo(outStream);
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Fallback: if anything fails during sanitization, move the raw zip directly
+                if (File.Exists(finalWindowsZipPath)) File.Delete(finalWindowsZipPath);
+                File.Move(rawAndroidZipPath, finalWindowsZipPath);
+            }
         }
 
         public async Task<string> RunADBAsync(string command, int timeoutMs = 3000)
@@ -1051,16 +1250,43 @@ namespace TestCamera
                     Task exitTask = Task.Run(() => process.WaitForExit());
                     Task timeoutTask = Task.Delay(timeoutMs);
 
-                    if (await Task.WhenAny(exitTask, timeoutTask).ConfigureAwait(false) == timeoutTask)
+                    if (await Task.WhenAny(exitTask, timeoutTask) == timeoutTask)
                     {
                         try { process.Kill(); } catch { }
                         return "";
                     }
-                    _ = await Task.WhenAll(readOut, readErr).ConfigureAwait(false);
+                    _ = await Task.WhenAll(readOut, readErr);
                     return (await readOut + " " + await readErr).Trim();
                 }
             }
             catch { return ""; }
+        }
+
+        // =========================================================================
+        // 🛠 FIX #3: WAIT FOR ANDROID DISPLAY/BOOT READY SO SCRCPY NEVER FAILS
+        // =========================================================================
+        private async Task<bool> WaitForAndroidDisplayReadyAsync(int maxWaitSeconds = 35)
+        {
+            for (int i = 0; i < maxWaitSeconds; i++)
+            {
+                if (!isDeviceConnected || _isPaused) return false;
+
+                string bootCompleted = await RunADBAsync("shell getprop sys.boot_completed", 2000);
+                if (bootCompleted != null && bootCompleted.Trim() == "1")
+                {
+                    return true;
+                }
+
+                // Also check if WindowManager/SurfaceFlinger is ready for scrcpy even before launcher finishes
+                string wmCheck = await RunADBAsync("shell service check window", 2000);
+                if (!string.IsNullOrEmpty(wmCheck) && wmCheck.Contains("found") && !wmCheck.Contains("not found") && i >= 6)
+                {
+                    return true;
+                }
+
+                await Task.Delay(1000);
+            }
+            return true;
         }
 
         private async Task LoadDeviceIdAsync()
@@ -1097,36 +1323,98 @@ namespace TestCamera
                             RefreshGridCount();
 
                             await RunADBAsync("root");
-                            await Task.Delay(1000);
+                            await Task.Delay(1500);
                             await RunADBAsync("wait-for-device", 5000);
 
                             await RunADBAsync("shell setprop persist.log.tag DEBUG");
+                            BroadcastSystemMessage("SYSTEM: Re-applying persist.log.tag DEBUG after reconnection", Color.DeepSkyBlue);
 
                             await RunADBAsync("shell setprop log.tag.VehicleHal VERBOSE");
                             await RunADBAsync("shell setprop log.tag.CarService VERBOSE");
                             await RunADBAsync("shell setprop log.tag.VehicleProperty VERBOSE");
 
-
+                            // Start logs immediately so boot logs are never missed
                             StartLogs(false, "1");
 
                             guna2Button1.Enabled = false;
                             guna2Button2.Enabled = true;
 
-                            if (form2 != null && !form2.IsDisposed)
+                            // Ensure form2 exists if needed
+                            if (form2 == null || form2.IsDisposed)
+                            {
+                                form2 = new Form2(adbPath, scrcpy_path);
+                                form2.FormClosing += (s, ev) =>
+                                {
+                                    if (ev.CloseReason == CloseReason.UserClosing)
+                                    {
+                                        ev.Cancel = true;
+                                        if (this.IsHandleCreated) this.BeginInvoke(new Action(() => Guna2Button2_Click(null, null)));
+                                    }
+                                };
+                            }
+
+                            // Only auto-reconnect video if user did NOT cancel video recording
+                            if (form2 != null && !form2.IsDisposed && !_videoRecordingCancelledByUser)
                             {
                                 bool hasCamera = CheckDevice(true);
-                                bool success = false;
+                                bool camSuccess = false;
 
                                 if (hasCamera)
                                 {
-                                    success = form2.testCamStart(true);
+                                    camSuccess = form2.testCamStart(true);
+                                    if (camSuccess)
+                                    {
+                                        form2.ArrangeLayout();
+                                        form2.Show();
+                                    }
                                 }
                                 else if (!skipScrcpy)
                                 {
-                                    success = await form2.StartAndEmbedScrcpy(true);
-                                }
+                                    // Run Scrcpy auto-reconnect in background after waiting for Android Display Service to finish booting
+                                    _ = Task.Run(async () =>
+                                    {
+                                        BroadcastSystemMessage("Waiting for Android Display Service to finish booting for ScreenCopy...", Color.DeepSkyBlue);
+                                        await WaitForAndroidDisplayReadyAsync(35);
 
-                                if (success) form2.Show();
+                                        for (int attempt = 1; attempt <= 5; attempt++)
+                                        {
+                                            if (!isDeviceConnected || _isPaused || !hasStartedManually || _videoRecordingCancelledByUser)
+                                                break;
+
+                                            bool scrcpySuccess = false;
+                                            if (this.IsHandleCreated)
+                                            {
+                                                TaskCompletionSource<bool> tcs = new TaskCompletionSource<bool>();
+                                                this.BeginInvoke(new Action(async () =>
+                                                {
+                                                    try
+                                                    {
+                                                        bool started = await form2.StartAndEmbedScrcpy(true);
+                                                        if (started)
+                                                        {
+                                                            form2.ArrangeLayout();
+                                                            form2.Show();
+                                                        }
+                                                        tcs.TrySetResult(started);
+                                                    }
+                                                    catch
+                                                    {
+                                                        tcs.TrySetResult(false);
+                                                    }
+                                                }));
+                                                scrcpySuccess = await tcs.Task;
+                                            }
+
+                                            if (scrcpySuccess)
+                                            {
+                                                BroadcastSystemMessage("ScreenCopy auto-recording resumed successfully!", Color.LimeGreen);
+                                                break;
+                                            }
+
+                                            await Task.Delay(3000);
+                                        }
+                                    });
+                                }
                             }
                         }
                     }
@@ -1149,7 +1437,7 @@ namespace TestCamera
         private async void Timer1_Tick(object sender, EventArgs e) { adb_timer?.Stop(); await LoadDeviceIdAsync(); adb_timer?.Start(); }
 
         //ZOMBIE ADB/SCRCPY PROCESSES
-        
+
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             this.Hide();
@@ -1228,8 +1516,20 @@ namespace TestCamera
                 {
                     scrcpy_path = openFileDialog.FileName;
                     string autoAdbPath = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(scrcpy_path), "adb.exe");
-                    if (System.IO.File.Exists(autoAdbPath)) { adbPath = autoAdbPath; MessageBox.Show("Success!"); }
-                    else { MessageBox.Show("adb.exe not found alongside scrcpy.exe"); }
+                    if (System.IO.File.Exists(autoAdbPath))
+                    {
+                        adbPath = autoAdbPath;
+                        if (form2 != null && !form2.IsDisposed)
+                        {
+                            try { form2.Dispose(); } catch { }
+                            form2 = null;
+                        }
+                        MessageBox.Show("Success!");
+                    }
+                    else
+                    {
+                        MessageBox.Show("adb.exe not found alongside scrcpy.exe");
+                    }
                 }
             }
         }
@@ -1240,7 +1540,12 @@ namespace TestCamera
 
         private async void bugBtn_Click(object sender, EventArgs e)
         {
-            if (!isDeviceConnected) { MessageBox.Show("No device is connected."); return; }
+            if (!isDeviceConnected)
+            {
+                MessageBox.Show("No device is connected.");
+                return;
+            }
+
             using (SaveFileDialog sfd = new SaveFileDialog())
             {
                 sfd.Title = "Save Android Bug Report";
@@ -1249,35 +1554,62 @@ namespace TestCamera
 
                 if (sfd.ShowDialog(this) == DialogResult.OK)
                 {
-                    BroadcastSystemMessage("Deleting old bug reports from phone storage...", Color.Orange);
-                    await Task.WhenAll(
-                        RunADBAsync("shell rm -rf /bugreports/*"),
-                        RunADBAsync("shell rm -rf /data/user_de/0/com.android.shell/files/bugreports/*")
-                    );
-                    BroadcastSystemMessage("Starting fresh Bug Report generation... Please wait.", Color.DodgerBlue);
-
-                    string adbResponse = await RunAdbBugReportAsync(sfd.FileName);
-
-                    BroadcastSystemMessage("Bug report saved! Wiping ALL PC & Phone data for your next test...", Color.Orange);
-
+                    // Pause device polling timer and active logcat streams so ADB USB transfer is 100% uninterrupted
+                    adb_timer?.Stop();
                     StopLogs();
-                    await DeepWipeDeviceAsync();
-                    ClearAllBuffers();
-                    RefreshGridCount();
 
-                    if (hasStartedManually && isDeviceConnected)
+                    try
                     {
-                        StartLogs(false, "1");
-                        BroadcastSystemMessage("Logs restarted completely fresh.", Color.LimeGreen);
-                    }
+                        BroadcastSystemMessage("Deleting old bug reports from phone storage...", Color.Orange);
+                        RefreshGridCount();
 
-                    MessageBox.Show("Bug report saved successfully to:\n" + sfd.FileName, "Success", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        await RunADBAsync("shell \"rm -rf /bugreports/* && rm -rf /data/user_de/0/com.android.shell/files/bugreports/*\"", 5000);
+
+                        BroadcastSystemMessage("Starting fresh Bug Report generation... Please wait.", Color.DodgerBlue);
+                        RefreshGridCount();
+
+                        string adbResponse = await RunAdbBugReportAsync(sfd.FileName);
+
+                        if (adbResponse == "Success" && File.Exists(sfd.FileName))
+                        {
+                            BroadcastSystemMessage("Bug report saved! Wiping ALL PC & Phone data for your next test...", Color.Orange);
+                            RefreshGridCount();
+
+                            await DeepWipeDeviceAsync();
+                            ClearAllBuffers();
+                            RefreshGridCount();
+
+                            if (hasStartedManually && isDeviceConnected)
+                            {
+                                StartLogs(false, "1");
+                                BroadcastSystemMessage("Logs restarted completely fresh.", Color.LimeGreen);
+                            }
+
+                            MessageBox.Show("Bug report saved successfully to:\n" + sfd.FileName, "Success", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        }
+                        else
+                        {
+                            BroadcastSystemMessage("Bug Report Error: " + adbResponse, Color.Red, "E");
+                            RefreshGridCount();
+
+                            if (hasStartedManually && isDeviceConnected)
+                            {
+                                StartLogs(false, "1");
+                            }
+
+                            MessageBox.Show("Bug report failed:\n" + adbResponse, "Bug Report Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        }
+                    }
+                    finally
+                    {
+                        adb_timer?.Start();
+                    }
                 }
             }
         }
 
         // ADB SERVER OVERLOAD PROTECTION
-       
+
         private async Task DeepWipeDeviceAsync()
         {
             try
@@ -1350,10 +1682,15 @@ namespace TestCamera
             string sourcePath = Path.Combine(_continuousLogFolder, sourceFileName);
             if (!File.Exists(sourcePath)) return;
 
-            using (FileStream zipToOpen = new FileStream(destZipPath, FileMode.Create))
+            using (FileStream zipToOpen = new FileStream(destZipPath, FileMode.Create, FileAccess.Write, FileShare.None))
             using (ZipArchive archive = new ZipArchive(zipToOpen, ZipArchiveMode.Create))
             {
-                archive.CreateEntryFromFile(sourcePath, sourceFileName.Replace("_continuous", ""), CompressionLevel.Optimal);
+                ZipArchiveEntry entry = archive.CreateEntry(sourceFileName.Replace("_continuous", ""), CompressionLevel.Optimal);
+                using (Stream entryStream = entry.Open())
+                using (FileStream sourceStream = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    sourceStream.CopyTo(entryStream);
+                }
             }
         }
 

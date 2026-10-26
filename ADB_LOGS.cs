@@ -39,6 +39,12 @@ namespace TestCamera
         public static string adbPath = "adb.exe";
         public static string scrcpy_path = "scrcpy.exe";
 
+        // Automatically detected paths for Nissan DA2 and Nissan EU
+        public static string scrcpy_DA2_path = "";
+        public static string scrcpy_EU_path = "";
+        public static string selectedNissanModel = "Nissan_DA2";
+        public static string detectedNissanModel = "";
+
         public Form2 form2;
 
         private enum LogView { None, ADB, Kernel, VHAL, PHAL }
@@ -84,7 +90,7 @@ namespace TestCamera
             InitializeComponent();
             this.Text = "ADB LOGS";
 
-            // Resolve full paths for adb.exe and scrcpy.exe inside the installed application folder
+            // Resolve full paths for adb.exe and scrcpy.exe automatically across the system
             ResolveToolPaths();
 
             panel1.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
@@ -161,10 +167,56 @@ namespace TestCamera
             _ = LoadDeviceIdAsync();
         }
 
+        /// <summary>
+        /// Checks the actual major version (1, 2, or 3) of any scrcpy.exe so DA2 (v1.x) and EU (v2.x/3.x) never get mixed up.
+        /// </summary>
+        public static int GetScrcpyMajorVersionStatic(string scrcpyExePath)
+        {
+            if (string.IsNullOrEmpty(scrcpyExePath) || !File.Exists(scrcpyExePath))
+                return 1;
+
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = scrcpyExePath,
+                    Arguments = "--version",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WorkingDirectory = Path.GetDirectoryName(scrcpyExePath)
+                };
+
+                using (Process p = Process.Start(psi))
+                {
+                    string output = p.StandardOutput.ReadToEnd() + " " + p.StandardError.ReadToEnd();
+                    p.WaitForExit(1500);
+
+                    Match m = Regex.Match(output, @"scrcpy\s+(\d+)\.", RegexOptions.IgnoreCase);
+                    if (m.Success && int.TryParse(m.Groups[1].Value, out int major))
+                    {
+                        return major;
+                    }
+                }
+            }
+            catch { }
+
+            if (scrcpyExePath.IndexOf("2.", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                scrcpyExePath.IndexOf("3.", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                scrcpyExePath.IndexOf("EU", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return 2;
+            }
+
+            return 1;
+        }
+
         private void ResolveToolPaths()
         {
             string startupDir = Application.StartupPath;
 
+            // 1. Check startup directory first
             string localAdb = Path.Combine(startupDir, "adb.exe");
             if (File.Exists(localAdb))
             {
@@ -175,7 +227,254 @@ namespace TestCamera
             if (File.Exists(localScrcpy))
             {
                 scrcpy_path = localScrcpy;
+                if (GetScrcpyMajorVersionStatic(localScrcpy) >= 2)
+                    scrcpy_EU_path = localScrcpy;
+                else
+                    scrcpy_DA2_path = localScrcpy;
             }
+
+            // 2. Find Nissan EU (v2.x / v3.x) first so we don't accidentally match it as DA2
+            string detectedEU = AutoFindScrcpyFolder(new[] { "scrcpy-win64-v2.4", "Nissan_EU", "scrcpy_EU", "v2.4", "v2.", "v3." }, excludeKeyword: "DA2", expectedMajorVersion: 2);
+            if (!string.IsNullOrEmpty(detectedEU))
+            {
+                scrcpy_EU_path = detectedEU;
+            }
+
+            // 3. Find Nissan DA2 (v1.x, excluding v2.4 / EU folders)
+            string detectedDA2 = AutoFindScrcpyFolder(new[] { "Nissan_DA2", "DA2", "scrcpy-da2", "scrcpy-win64-v1", "scrcpy" }, excludeKeyword: "v2.4", expectedMajorVersion: 1);
+            if (!string.IsNullOrEmpty(detectedDA2))
+            {
+                scrcpy_DA2_path = detectedDA2;
+            }
+
+            // 4. Set initial active scrcpy & prefer newest adb.exe so ADB server never restarts mid-session
+            if (!string.IsNullOrEmpty(scrcpy_EU_path) && File.Exists(scrcpy_EU_path))
+            {
+                string euAdb = Path.Combine(Path.GetDirectoryName(scrcpy_EU_path), "adb.exe");
+                if (File.Exists(euAdb)) adbPath = euAdb;
+            }
+            else if (!string.IsNullOrEmpty(scrcpy_DA2_path) && File.Exists(scrcpy_DA2_path))
+            {
+                string da2Adb = Path.Combine(Path.GetDirectoryName(scrcpy_DA2_path), "adb.exe");
+                if (File.Exists(da2Adb)) adbPath = da2Adb;
+            }
+
+            if (!string.IsNullOrEmpty(scrcpy_DA2_path) && File.Exists(scrcpy_DA2_path))
+            {
+                scrcpy_path = scrcpy_DA2_path;
+            }
+            else if (!string.IsNullOrEmpty(scrcpy_EU_path) && File.Exists(scrcpy_EU_path))
+            {
+                scrcpy_path = scrcpy_EU_path;
+            }
+        }
+
+        /// <summary>
+        /// Automatically searches common locations across any PC (App folder, Desktop, Downloads, UserProfile, and all Drive roots)
+        /// and verifies the scrcpy version so DA2 (1.x) and EU (2.x/3.x) are always matched accurately.
+        /// </summary>
+        private string AutoFindScrcpyFolder(string[] possibleFolderNames, string excludeKeyword = "", int expectedMajorVersion = 0)
+        {
+            List<string> searchRoots = new List<string>
+            {
+                Application.StartupPath,
+                Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads"),
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)
+            };
+
+            foreach (DriveInfo drive in DriveInfo.GetDrives().Where(d => d.IsReady && d.DriveType == DriveType.Fixed))
+            {
+                searchRoots.Add(drive.RootDirectory.FullName);
+            }
+
+            foreach (string root in searchRoots.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                if (string.IsNullOrEmpty(root) || !Directory.Exists(root)) continue;
+
+                foreach (string folderName in possibleFolderNames)
+                {
+                    try
+                    {
+                        string directPath = Path.Combine(root, folderName, "scrcpy.exe");
+                        if (File.Exists(directPath))
+                        {
+                            if (string.IsNullOrEmpty(excludeKeyword) || directPath.IndexOf(excludeKeyword, StringComparison.OrdinalIgnoreCase) < 0)
+                            {
+                                int ver = GetScrcpyMajorVersionStatic(directPath);
+                                if (expectedMajorVersion == 0 || (expectedMajorVersion == 1 && ver == 1) || (expectedMajorVersion >= 2 && ver >= 2))
+                                    return directPath;
+                            }
+                        }
+
+                        foreach (string subDir in Directory.GetDirectories(root, "*", SearchOption.TopDirectoryOnly))
+                        {
+                            string dirName = Path.GetFileName(subDir);
+                            if (dirName.StartsWith("$") || dirName.Equals("Windows", StringComparison.OrdinalIgnoreCase) ||
+                                dirName.Equals("Program Files", StringComparison.OrdinalIgnoreCase) ||
+                                dirName.Equals("Program Files (x86)", StringComparison.OrdinalIgnoreCase))
+                                continue;
+
+                            if (!string.IsNullOrEmpty(excludeKeyword) && dirName.IndexOf(excludeKeyword, StringComparison.OrdinalIgnoreCase) >= 0)
+                                continue;
+
+                            if (dirName.IndexOf(folderName, StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                string candidate = Path.Combine(subDir, "scrcpy.exe");
+                                if (File.Exists(candidate))
+                                {
+                                    int ver = GetScrcpyMajorVersionStatic(candidate);
+                                    if (expectedMajorVersion == 0 || (expectedMajorVersion == 1 && ver == 1) || (expectedMajorVersion >= 2 && ver >= 2))
+                                        return candidate;
+                                }
+                            }
+
+                            string nestedCandidate = Path.Combine(subDir, folderName, "scrcpy.exe");
+                            if (File.Exists(nestedCandidate))
+                            {
+                                if (string.IsNullOrEmpty(excludeKeyword) || nestedCandidate.IndexOf(excludeKeyword, StringComparison.OrdinalIgnoreCase) < 0)
+                                {
+                                    int ver = GetScrcpyMajorVersionStatic(nestedCandidate);
+                                    if (expectedMajorVersion == 0 || (expectedMajorVersion == 1 && ver == 1) || (expectedMajorVersion >= 2 && ver >= 2))
+                                        return nestedCandidate;
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+                }
+            }
+
+            return "";
+        }
+
+        /// <summary>
+        /// Automatically detects whether the connected Android device is Nissan DA2 or Nissan EU via ADB properties.
+        /// </summary>
+        private string DetectConnectedNissanModel()
+        {
+            try
+            {
+                using (Process p = new Process())
+                {
+                    p.StartInfo = new ProcessStartInfo
+                    {
+                        FileName = adbPath,
+                        Arguments = "shell \"getprop ro.build.version.sdk; getprop ro.product.name; getprop ro.build.product\"",
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        CreateNoWindow = true
+                    };
+                    p.Start();
+                    string output = p.StandardOutput.ReadToEnd().Trim().ToLowerInvariant();
+                    p.WaitForExit(2000);
+
+                    if (!string.IsNullOrEmpty(output))
+                    {
+                        if (output.Contains("da2")) return "Nissan_DA2";
+                        if (output.Contains("eu")) return "Nissan_EU";
+
+                        string[] lines = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                        if (lines.Length > 0 && int.TryParse(lines[0].Trim(), out int sdkVersion))
+                        {
+                            if (sdkVersion >= 31)
+                                return "Nissan_EU";
+                            else
+                                return "Nissan_DA2";
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            bool hasDA2 = !string.IsNullOrEmpty(scrcpy_DA2_path) && File.Exists(scrcpy_DA2_path);
+            bool hasEU = !string.IsNullOrEmpty(scrcpy_EU_path) && File.Exists(scrcpy_EU_path);
+
+            if (hasEU && !hasDA2) return "Nissan_EU";
+            if (hasDA2 && !hasEU) return "Nissan_DA2";
+
+            return "Nissan_EU";
+        }
+
+        /// <summary>
+        /// Automatically selects the detected Nissan Scrcpy version (Nissan EU or Nissan DA2)
+        /// WITHOUT prompting the user with a second "Select Nissan Project" dialog!
+        /// </summary>
+        private bool SelectNissanScrcpyVariant()
+        {
+            if (string.IsNullOrEmpty(scrcpy_DA2_path) || !File.Exists(scrcpy_DA2_path) ||
+                string.IsNullOrEmpty(scrcpy_EU_path) || !File.Exists(scrcpy_EU_path))
+            {
+                ResolveToolPaths();
+            }
+
+            detectedNissanModel = DetectConnectedNissanModel();
+
+            if (detectedNissanModel == "Nissan_EU")
+            {
+                selectedNissanModel = "Nissan_EU";
+                if (!string.IsNullOrEmpty(scrcpy_EU_path) && File.Exists(scrcpy_EU_path))
+                {
+                    scrcpy_path = scrcpy_EU_path;
+                }
+                else if (!string.IsNullOrEmpty(scrcpy_DA2_path) && File.Exists(scrcpy_DA2_path))
+                {
+                    scrcpy_path = scrcpy_DA2_path;
+                }
+            }
+            else
+            {
+                selectedNissanModel = "Nissan_DA2";
+                if (!string.IsNullOrEmpty(scrcpy_DA2_path) && File.Exists(scrcpy_DA2_path))
+                {
+                    scrcpy_path = scrcpy_DA2_path;
+                }
+                else if (!string.IsNullOrEmpty(scrcpy_EU_path) && File.Exists(scrcpy_EU_path))
+                {
+                    scrcpy_path = scrcpy_EU_path;
+                }
+            }
+
+            if (string.IsNullOrEmpty(scrcpy_path) || !File.Exists(scrcpy_path))
+            {
+                using (OpenFileDialog ofd = new OpenFileDialog())
+                {
+                    ofd.Title = $"Select scrcpy.exe for {selectedNissanModel}";
+                    ofd.Filter = "scrcpy.exe|scrcpy.exe|Executable files (*.exe)|*.exe";
+                    if (ofd.ShowDialog(this) == DialogResult.OK)
+                    {
+                        scrcpy_path = ofd.FileName;
+                        if (selectedNissanModel == "Nissan_EU") scrcpy_EU_path = ofd.FileName;
+                        else scrcpy_DA2_path = ofd.FileName;
+                    }
+                    else
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            string euDir = !string.IsNullOrEmpty(scrcpy_EU_path) ? Path.GetDirectoryName(scrcpy_EU_path) : "";
+            string euAdb = !string.IsNullOrEmpty(euDir) ? Path.Combine(euDir, "adb.exe") : "";
+
+            if (!string.IsNullOrEmpty(euAdb) && File.Exists(euAdb))
+            {
+                adbPath = euAdb;
+            }
+            else
+            {
+                string dir = Path.GetDirectoryName(scrcpy_path);
+                string matchingAdb = Path.Combine(dir, "adb.exe");
+                if (File.Exists(matchingAdb))
+                {
+                    adbPath = matchingAdb;
+                }
+            }
+
+            BroadcastSystemMessage($"Auto-Selected {selectedNissanModel} -> {scrcpy_path}", Color.DeepSkyBlue);
+            return true;
         }
 
         private void BroadcastSystemMessage(string message, Color color, string level = "I")
@@ -212,7 +511,15 @@ namespace TestCamera
                             MessageBoxButtons.OKCancel,
                             MessageBoxIcon.Information);
 
-                        skipScrcpy = (res != DialogResult.OK);
+                        if (res == DialogResult.OK)
+                        {
+                            // Automatically selects Nissan DA2 or Nissan EU without prompting the user again!
+                            skipScrcpy = !SelectNissanScrcpyVariant();
+                        }
+                        else
+                        {
+                            skipScrcpy = true;
+                        }
                     }
                     return false;
                 }
@@ -631,9 +938,6 @@ namespace TestCamera
             });
         }
 
-        // ==========================================
-        // 🛠 FIX #1: MEMORY LEAK & CPU SPIN FIXED
-        // ==========================================
         private void WriteQueueToFileSafe(ConcurrentQueue<string> queue, string filePath)
         {
             if (queue.IsEmpty) return;
@@ -649,7 +953,6 @@ namespace TestCamera
                 }
                 catch (Exception)
                 {
-                    // If file is locked, place items back and rest the thread to prevent 100% CPU usage
                     foreach (string failedLine in lines) queue.Enqueue(failedLine);
                     System.Threading.Thread.Sleep(2000);
                 }
@@ -918,6 +1221,9 @@ namespace TestCamera
 
             try
             {
+                // Check camera; if no camera and user clicks OK, it auto-detects & selects Scrcpy (DA2 or EU) automatically without another prompt!
+                bool hasCamera = CheckDevice(false);
+
                 if (!hasStartedManually)
                 {
                     _videoRecordingCancelledByUser = false;
@@ -956,50 +1262,52 @@ namespace TestCamera
                     RefreshGridCount();
                 }
 
-                if (form2 == null || form2.IsDisposed)
+                if (form2 != null && !form2.IsDisposed)
                 {
-                    form2 = new Form2(adbPath, scrcpy_path);
-                    form2.FormClosing += (s, ev) =>
-                    {
-                        if (ev.CloseReason == CloseReason.UserClosing)
-                        {
-                            ev.Cancel = true;
-                            if (this.IsHandleCreated) this.BeginInvoke(new Action(() => Guna2Button2_Click(null, null)));
-                        }
-                    };
+                    try { form2.Dispose(); } catch { }
+                    form2 = null;
                 }
 
-                bool hasCamera = CheckDevice(false);
+                form2 = new Form2(adbPath, scrcpy_path);
+                form2.FormClosing += (s, ev) =>
+                {
+                    if (ev.CloseReason == CloseReason.UserClosing)
+                    {
+                        ev.Cancel = true;
+                        if (this.IsHandleCreated) this.BeginInvoke(new Action(() => Guna2Button2_Click(null, null)));
+                    }
+                };
+
                 bool camStarted = false;
                 bool scrcpyStarted = false;
 
                 if (hasCamera)
                 {
                     camStarted = form2.testCamStart();
-                    if (!camStarted)
+                    if (camStarted)
                     {
-                        // User clicked Cancel or X on Webcam Save Dialog -> Do NOT ask again, run Logs ONLY!
+                        form2.ArrangeLayout();
+                        form2.Show();
+                    }
+                    else
+                    {
                         _videoRecordingCancelledByUser = true;
                         skipScrcpy = true;
                     }
                 }
                 else if (!skipScrcpy)
                 {
+                    // DO NOT call form2.Show() before StartAndEmbedScrcpy()!
+                    // StartAndEmbedScrcpy() asks where to save first, embeds Scrcpy off-screen, and then shows Form2 ONCE cleanly with zero flicker!
                     scrcpyStarted = await form2.StartAndEmbedScrcpy();
                     if (!scrcpyStarted)
                     {
-                        // User clicked Cancel or X on Scrcpy Save Dialog -> Do NOT ask again, run Logs ONLY!
                         _videoRecordingCancelledByUser = true;
                         skipScrcpy = true;
                     }
                 }
 
-                if (camStarted || scrcpyStarted)
-                {
-                    form2.ArrangeLayout();
-                    form2.Show();
-                }
-                else
+                if (!camStarted && !scrcpyStarted)
                 {
                     BroadcastSystemMessage("Video recording skipped/cancelled. Logs are running...", Color.DeepPink);
                 }
@@ -1030,9 +1338,6 @@ namespace TestCamera
             AutoSaveAllLogsToZip();
         }
 
-        // =========================================================================
-        // 🛠 FIX #2: COMPLETE, UNCORRUPTED BUGREPORT GENERATION & EXTRACTION FIX
-        // =========================================================================
         public async Task<string> RunAdbBugReportAsync(string savePath)
         {
             string result = "Success";
@@ -1050,7 +1355,7 @@ namespace TestCamera
 
                 Label lbl = new Label()
                 {
-                    Text = "Generating Bug Report... Please wait (2 to 5 mins).\nDo NOT disconnect the device.\nStarting dumpstate...",
+                    Text = "Generating Bug Report... Please wait (2 to 5 mins).\nDo not disconnect the device.\nStarting dumpstate...",
                     Location = new Point(20, 15),
                     AutoSize = true
                 };
@@ -1120,7 +1425,6 @@ namespace TestCamera
                                 process.BeginOutputReadLine();
                                 process.BeginErrorReadLine();
 
-                                // Allow up to 10 minutes (600,000 ms)
                                 if (!process.WaitForExit(600000))
                                 {
                                     try { process.Kill(); } catch { }
@@ -1128,12 +1432,10 @@ namespace TestCamera
                                 }
                                 else
                                 {
-                                    // Flush all remaining async output events
                                     process.WaitForExit();
                                 }
                             }
 
-                            // Allow OS 1 second to completely release file locks
                             System.Threading.Thread.Sleep(1000);
 
                             if (result == "Success")
@@ -1158,7 +1460,6 @@ namespace TestCamera
                                         catch { }
                                     }
 
-                                    // Repackage cleanly without Linux symlink attributes so 7-Zip / Windows Extract All never gets stuck!
                                     SanitizeBugReportZipForWindows(generatedZip, savePath);
                                 }
                                 else
@@ -1186,10 +1487,6 @@ namespace TestCamera
             return result;
         }
 
-        /// <summary>
-        /// Copies all standard files from the Android bugreport zip into a clean Windows-compatible zip,
-        /// stripping Unix symlink external attributes that cause 7-Zip to halt with "Cannot create symbolic link".
-        /// </summary>
         private void SanitizeBugReportZipForWindows(string rawAndroidZipPath, string finalWindowsZipPath)
         {
             try
@@ -1207,11 +1504,9 @@ namespace TestCamera
                     {
                         if (string.IsNullOrEmpty(entry.Name)) continue;
 
-                        // Check Unix mode in upper 16 bits of ExternalAttributes: 0xA000 is S_IFLNK (Linux Symbolic Link)
                         int unixFileType = (entry.ExternalAttributes >> 16) & 0xF000;
                         if (unixFileType == 0xA000)
                         {
-                            // Skip Linux symbolic link entries that cause 7-Zip extraction errors on Windows
                             continue;
                         }
 
@@ -1232,7 +1527,6 @@ namespace TestCamera
             }
             catch
             {
-                // Fallback: if anything fails during sanitization, move the raw zip directly
                 if (File.Exists(finalWindowsZipPath)) File.Delete(finalWindowsZipPath);
                 File.Move(rawAndroidZipPath, finalWindowsZipPath);
             }
@@ -1262,9 +1556,6 @@ namespace TestCamera
             catch { return ""; }
         }
 
-        // =========================================================================
-        // 🛠 FIX #3: WAIT FOR ANDROID DISPLAY/BOOT READY SO SCRCPY NEVER FAILS
-        // =========================================================================
         private async Task<bool> WaitForAndroidDisplayReadyAsync(int maxWaitSeconds = 35)
         {
             for (int i = 0; i < maxWaitSeconds; i++)
@@ -1277,7 +1568,6 @@ namespace TestCamera
                     return true;
                 }
 
-                // Also check if WindowManager/SurfaceFlinger is ready for scrcpy even before launcher finishes
                 string wmCheck = await RunADBAsync("shell service check window", 2000);
                 if (!string.IsNullOrEmpty(wmCheck) && wmCheck.Contains("found") && !wmCheck.Contains("not found") && i >= 6)
                 {
@@ -1333,13 +1623,11 @@ namespace TestCamera
                             await RunADBAsync("shell setprop log.tag.CarService VERBOSE");
                             await RunADBAsync("shell setprop log.tag.VehicleProperty VERBOSE");
 
-                            // Start logs immediately so boot logs are never missed
                             StartLogs(false, "1");
 
                             guna2Button1.Enabled = false;
                             guna2Button2.Enabled = true;
 
-                            // Ensure form2 exists if needed
                             if (form2 == null || form2.IsDisposed)
                             {
                                 form2 = new Form2(adbPath, scrcpy_path);
@@ -1353,7 +1641,6 @@ namespace TestCamera
                                 };
                             }
 
-                            // Only auto-reconnect video if user did NOT cancel video recording
                             if (form2 != null && !form2.IsDisposed && !_videoRecordingCancelledByUser)
                             {
                                 bool hasCamera = CheckDevice(true);
@@ -1370,7 +1657,6 @@ namespace TestCamera
                                 }
                                 else if (!skipScrcpy)
                                 {
-                                    // Run Scrcpy auto-reconnect in background after waiting for Android Display Service to finish booting
                                     _ = Task.Run(async () =>
                                     {
                                         BroadcastSystemMessage("Waiting for Android Display Service to finish booting for ScreenCopy...", Color.DeepSkyBlue);
@@ -1390,11 +1676,6 @@ namespace TestCamera
                                                     try
                                                     {
                                                         bool started = await form2.StartAndEmbedScrcpy(true);
-                                                        if (started)
-                                                        {
-                                                            form2.ArrangeLayout();
-                                                            form2.Show();
-                                                        }
                                                         tcs.TrySetResult(started);
                                                     }
                                                     catch
@@ -1436,8 +1717,6 @@ namespace TestCamera
 
         private async void Timer1_Tick(object sender, EventArgs e) { adb_timer?.Stop(); await LoadDeviceIdAsync(); adb_timer?.Start(); }
 
-        //ZOMBIE ADB/SCRCPY PROCESSES
-
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             this.Hide();
@@ -1451,8 +1730,6 @@ namespace TestCamera
                 {
                     form2.testCamStop();
                     form2.StopScrcpyGracefully();
-
-                    // Allow the threads 500ms to cleanly close tools before environment nuke
                     System.Threading.Thread.Sleep(500);
                 }
                 catch { }
@@ -1554,7 +1831,6 @@ namespace TestCamera
 
                 if (sfd.ShowDialog(this) == DialogResult.OK)
                 {
-                    // Pause device polling timer and active logcat streams so ADB USB transfer is 100% uninterrupted
                     adb_timer?.Stop();
                     StopLogs();
 
@@ -1608,18 +1884,14 @@ namespace TestCamera
             }
         }
 
-        // ADB SERVER OVERLOAD PROTECTION
-
         private async Task DeepWipeDeviceAsync()
         {
             try
             {
-                // 1. Clear core logs independently
-                await RunADBAsync("shell setprop persist.log.tag DEBUG"); // Reinforce debug logging
+                await RunADBAsync("shell setprop persist.log.tag DEBUG");
                 await RunADBAsync("logcat -b all -c");
                 await RunADBAsync("logcat -b kernel -c");
 
-                // 2. Chain shell clear commands into ONE session (protects ADB Daemon from crashing)
                 string wipeCommand = "shell \"dmesg -c && rm -rf /data/tombstones/* && rm -rf /data/anr/* && rm -rf /data/system/dropbox/* && rm -rf /bugreports/* && rm -rf /data/user_de/0/com.android.shell/files/bugreports/*\"";
                 await RunADBAsync(wipeCommand);
             }
